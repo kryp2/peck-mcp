@@ -11,7 +11,8 @@
     "test": "node --loader ts-node/esm src/test-tx.ts"
   },
   "dependencies": {
-    "@bsv/sdk": "^2.0.13"
+    "@bsv/sdk": "^2.0.13",
+    "tsx": "^4.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
