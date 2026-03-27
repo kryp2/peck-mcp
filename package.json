@@ -1,0 +1,21 @@
+{
+  "name": "hackathon-agentic-pay",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Open Run Agentic Pay hackathon — two AI agents trading via BSV micropayments",
+  "scripts": {
+    "build": "tsc",
+    "agent:a": "node --loader ts-node/esm src/agent-a.ts",
+    "agent:b": "node --loader ts-node/esm src/agent-b.ts",
+    "demo": "node --loader ts-node/esm src/demo.ts",
+    "test": "node --loader ts-node/esm src/test-tx.ts"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.0.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}
