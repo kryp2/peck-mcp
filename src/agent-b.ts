@@ -8,6 +8,7 @@
  */
 
 import { PrivateKey } from '@bsv/sdk'
+import { AgentIdentity } from './identity.js'
 
 interface AgentConfig {
   name: string
@@ -15,6 +16,7 @@ interface AgentConfig {
   peerPublicKey?: string
   arcEndpoint: string
   network: 'testnet' | 'mainnet'
+  identity?: AgentIdentity
 }
 
 class AgentB {
