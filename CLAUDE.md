@@ -1,25 +1,55 @@
-# hackathon-agentic-pay
+# hackathon-agentic-pay — "Peck Pay"
 
 Open Run Agentic Pay hackathon — April 6-17, 2026.
-Two AI agents trading via BSV micropayments. 1.5M TXs in 24h.
+AI-agent mikrotjeneste-markedsplass med BSV-mikrobetalinger.
+
+## Konsept
+Markedsplass der AI-agenter tilbyr og konsumerer mikrotjenester.
+Betaling via BSV — ingen API-keys, ingen abonnement, ingen mellommenn.
+Enhver tjeneste under $1 blir økonomisk mulig (BSV tx fee: $0.0001).
 
 ## Stack
-- **Runtime:** Node.js + TypeScript (ESM)
-- **BSV:** @bsv/sdk for transactions, @bsv/simple for high-level wallet ops
-- **Network:** Testnet (Chronicle active), switch to mainnet for competition
-- **Broadcasting:** ARC/Arcade via `https://arc.gorillapool.io`
-- **P2P:** MessageBox for agent discovery + BRC-103 auth
+- **Runtime:** Node.js + TypeScript (ESM) — orchestrator, HTTP, LLM
+- **Crypto core:** Zeta lang — signing, tx building, UTXO management
+- **Bridge:** ZeroMQ (Zeta ↔ TypeScript)
+- **BSV:** @bsv/sdk (TypeScript), native intrinsics (Zeta)
+- **Identity:** BRC-103 agent identity, SIWB-100 auth
+- **Network:** ARC/ARCADE (SSE), Teranode WebSocket
+- **Chronicle:** OTDA sighash 0x20, restored opcodes
 
 ## Architecture
-- **Strategy layer** (LLM): periodic calls to adjust pricing/rules (~every 5 min)
-- **Execution layer** (reflex): deterministic hot loop at ~17 TPS
-- Agent A ("Adam"): data provider, sells resources
-- Agent B ("Eva"): data consumer, buys and analyzes
+```
+┌─────────────────────────────────────────┐
+│         Marketplace Dashboard           │
+│    (React/HTML — live agent activity)   │
+└──────────────┬──────────────────────────┘
+               │ WebSocket
+┌──────────────┴──────────────────────────┐
+│         TypeScript Orchestrator          │
+│  - HTTP 402 protocol (x402)             │
+│  - Service discovery (BRC-103)          │
+│  - LLM calls (strategy layer)          │
+│  - Agent lifecycle management           │
+└──────────────┬──────────────────────────┘
+               │ ZeroMQ
+┌──────────────┴──────────────────────────┐
+│           Zeta Crypto Core              │
+│  - ECDSA/Schnorr signing (<0.1ms)      │
+│  - UTXO management (actor-isolated)    │
+│  - Transaction building (CTFE)         │
+│  - Teranode broadcast (WebSocket)      │
+│  - BRC-100 capability scripts          │
+└─────────────────────────────────────────┘
+```
 
-## Key files
-- `src/agent-a.ts` — Adam agent (provider)
-- `src/agent-b.ts` — Eva agent (consumer)
-- `src/test-tx.ts` — Basic SDK/wallet test
+## Task blocks (30 tasks, 7 blocks)
+- **Block 1** (pri 1): Foundation — Zeta env, BRC-103 identity, HTTP 402
+- **Block 2** (pri 2): Core — Zeta crypto, service/client agent SDK, A2A protocol, MCP server, WASM
+- **Block 3** (pri 3): Infrastructure — ARCADE SSE, Chronicle opcodes, CNP bidding, reputation, OP_VER overlay, recursive covenants
+- **Block 4** (pri 4): Product — Dashboard webapp, payment channels, semantic cache, hero services (merdata/beviset/heltenig), metering engine
+- **Block 5** (pri 5): Demo agents — 5+ standard agents, oracle/data feeds, compute agents, mainnet deploy, pitch
+- **Block 6** (pri 6): Advanced — Off-chain EVM execution, WASM micro-compute, developer SDK
+- **Block 7** (pri 7): Scale — Agent swarm simulation (5000 agents), 1.5M transaction demo harness
 
 ## Hackathon requirements
 - 2+ AI agents with individual BSV wallets
@@ -31,13 +61,14 @@ Two AI agents trading via BSV micropayments. 1.5M TXs in 24h.
 ## Commands
 ```bash
 npm install
-npm run test       # Test SDK + generate wallets
-npm run agent:a    # Start Adam
-npm run agent:b    # Start Eva
+npx tsx src/test-identity.ts   # Test BRC-103 identity
+npx tsx src/test-402.ts        # Test HTTP 402 flow
+npx tsx src/agent-service.ts   # Start a service agent
+npx tsx src/agent-client.ts    # Start client agent
 ```
 
-## Testnet
-- Explorer: https://test.whatsonchain.com
+## Networks
+- Testnet: Chronicle active since block 1,713,168
+- Mainnet: Chronicle activates April 7, 2026 (block 943,816)
 - ARC: https://arc.gorillapool.io
-- Chronicle active since blokkhøyde 1,713,168 (Jan 2026)
-- Mainnet Chronicle: April 7, 2026 (blokkhøyde 943,816)
+- Explorer: https://whatsonchain.com
