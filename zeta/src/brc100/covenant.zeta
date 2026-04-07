@@ -1,0 +1,273 @@
+// BRC-100 Recursive Covenant Capability Tokens
+// Chronicle OTDA + OP_SUBSTR enables self-replicating smart contracts.
+// "Denne kontrakten var umulig før 7. april 2026."
+//
+// Pattern: quine covenant — spending tx must recreate the same locking script
+// with updated state (decremented scope counter).
+
+import { ctfe } from "std/meta";
+import { hex } from "std/encoding";
+import { hash } from "std/crypto";
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+// OTDA sighash flag (0x20) — Chronicle-activated preimage access
+pub const SIGHASH_OTDA: u8 = 0x20;
+
+// BRC-100 capability operation prefix
+pub const BRC100_COP_PREFIX: []u8 = hex.decode("627263313030636f70"); // "brc100cop"
+
+// Maximum capability scope (API call budget)
+pub const MAX_SCOPE: u32 = 50;
+
+// ─── Covenant state ──────────────────────────────────────────────────────────
+
+pub struct CovenantState {
+    // BRC-103 pubkey of the agent authorised to spend
+    agent_pubkey_hash: []u8,   // 20 bytes (HASH160)
+    // Remaining capability uses
+    scope_remaining: u32,
+    // Capability type tag (e.g. "api_call", "translate", "summarize")
+    capability_tag: String,
+    // Hash of the covenant template (without state fields) for self-replication check
+    covenant_template_hash: []u8, // 32 bytes SHA-256
+}
+
+// ─── Locking script (CTFE-compiled template) ────────────────────────────────
+//
+// Stack layout when this script runs (OTDA mode):
+//   <sig>  <pubkey>  <new_scope>  (unlocking script pushes these)
+//
+// The locking script then:
+//   1. Verifies pubkey matches authorised agent (BRC-103 check)
+//   2. Verifies sig over tx hash (CHECKSIG)
+//   3. Parses tx preimage via OP_SUBSTR to extract the first output's locking script
+//   4. Verifies first output recreates this covenant with (scope - 1)
+//   5. Verifies new_scope == scope_remaining - 1  (state transition validity)
+//   6. If scope_remaining == 0, fails (token exhausted)
+//
+// Note: This is a conceptual representation. In production BSV Script the
+// OP_SUBSTR offsets into the OTDA preimage depend on the exact serialisation
+// layout defined by Chronicle.
+
+pub const COVENANT_LOCKING_TEMPLATE = ctfe.compile_script("
+    // ── 1. Scope guard ─────────────────────────────────────────────────────
+    // Fail immediately if scope is already 0
+    OP_DEPTH OP_1SUB OP_PICK          // peek new_scope from stack top
+    OP_0 OP_EQUAL OP_NOT              // new_scope != 0  (spending is allowed)
+    OP_VERIFY
+
+    // ── 2. BRC-103 agent identity check ────────────────────────────────────
+    // Stack: <sig> <pubkey> <new_scope>
+    OP_2 OP_PICK                      // dup pubkey (index 1)
+    OP_HASH160
+    <agent_pubkey_hash>               // template param — 20 bytes
+    OP_EQUALVERIFY                    // pubkey must match authorised agent
+
+    // ── 3. Signature verification (CHECKSIG) ───────────────────────────────
+    OP_2 OP_PICK                      // dup sig
+    OP_2 OP_PICK                      // dup pubkey
+    OP_CHECKSIGVERIFY
+
+    // ── 4. OTDA preimage access — extract first output script ───────────────
+    // Under Chronicle OTDA the full tx preimage is available via OP_PUSH_TX.
+    // We use OP_SUBSTR to carve out the first output's locking script bytes.
+    //
+    // Preimage layout (BIP143-like, OTDA variant):
+    //   [4]  version
+    //   [32] hashPrevouts
+    //   [32] hashSequence
+    //   [36] outpoint (txid+vout of THIS input)
+    //   [var] scriptCode of THIS input
+    //   [8]  value of THIS input
+    //   [4]  sequence
+    //   [32] hashOutputs   ← we use this to bind to all outputs
+    //   [4]  locktime
+    //   [4]  sighash type
+    //
+    // Chronicle variant pushes the full preimage on the stack via OP_PUSH_TX.
+    OP_PUSH_TX                        // Chronicle opcode: push OTDA preimage
+
+    // Extract hashOutputs (offset 108, length 32 in base case — exact offset
+    // depends on scriptCode varint; here we use a fixed-size covenant script).
+    <preimage_hash_outputs_offset>    // CTFE constant: byte offset of hashOutputs
+    32                                // length
+    OP_SUBSTR                         // stack: <preimage> → <hashOutputs>
+
+    // ── 5. Verify output recreates covenant with decremented scope ──────────
+    // Compute expected locking script for the new UTXO:
+    //   covenant_template_hash ++ encode_u32(new_scope) ++ agent_pubkey_hash
+    // then HASH256 it and compare to the output's scriptHash embedded in hashOutputs.
+    //
+    // new_scope is already on the stack (pushed by unlocking script).
+    OP_SWAP                           // stack: <new_scope> <hashOutputs>
+
+    // Validate new_scope == scope_remaining - 1
+    <scope_remaining>                 // template param — current scope (u32 LE)
+    OP_1SUB                           // scope_remaining - 1
+    OP_2 OP_PICK                      // dup new_scope
+    OP_EQUALVERIFY                    // must match
+
+    // Build expected output script hash
+    <covenant_template_hash>          // 32 bytes: hash of static covenant body
+    OP_SWAP                           // stack: <new_scope_bytes> <covenant_hash>
+    OP_CAT                            // append new_scope
+    <agent_pubkey_hash>               // 20 bytes
+    OP_CAT                            // full covenant data
+    OP_SHA256                         // expected script hash
+
+    // Compare with hashOutputs from preimage
+    // (hashOutputs = DSHA256 of all serialised outputs; for single-output
+    //  covenants this equals DSHA256 of the one output — verified here)
+    OP_SWAP
+    OP_EQUALVERIFY                    // covenant self-replication enforced
+
+    // ── 6. Clean stack — drop remaining items ──────────────────────────────
+    // Clean Stack rule (Chronicle): script must leave exactly OP_1 on stack.
+    OP_2DROP                          // drop sig + pubkey remnants
+    OP_1                              // success
+");
+
+// ─── Covenant builder ────────────────────────────────────────────────────────
+
+pub struct CovenantBuilder {}
+
+impl CovenantBuilder {
+    // Build a locking script for a new capability token covenant.
+    pub fn build_locking_script(state: CovenantState) []u8 {
+        let template_hash = compute_template_hash();
+
+        // Fill CTFE template parameters
+        let script = COVENANT_LOCKING_TEMPLATE
+            .fill("agent_pubkey_hash", state.agent_pubkey_hash)
+            .fill("scope_remaining", u32_to_le_bytes(state.scope_remaining))
+            .fill("covenant_template_hash", template_hash)
+            .fill("preimage_hash_outputs_offset", u32_to_le_bytes(108));
+
+        return script;
+    }
+
+    // Build an unlocking script (scriptSig) that spends a covenant UTXO.
+    // The unlocking script pushes: <sig> <pubkey> <new_scope_le>
+    pub fn build_unlocking_script(
+        sig: []u8,
+        pubkey: []u8,
+        new_scope: u32,
+    ) []u8 {
+        let mut script = []u8{};
+        script = push_data(script, sig);
+        script = push_data(script, pubkey);
+        script = push_data(script, u32_to_le_bytes(new_scope));
+        return script;
+    }
+
+    // Compute state hash of a covenant (for transfer / verification).
+    pub fn state_hash(state: CovenantState) []u8 {
+        let mut data = []u8{};
+        data.append(state.agent_pubkey_hash);
+        data.append(u32_to_le_bytes(state.scope_remaining));
+        data.append(str_to_bytes(state.capability_tag));
+        return hash.sha256(data);
+    }
+
+    // Check whether this covenant still has usable scope.
+    pub fn is_exhausted(state: CovenantState) bool {
+        return state.scope_remaining == 0;
+    }
+
+    // Produce the next state after one capability use.
+    pub fn decrement_scope(state: CovenantState) CovenantState {
+        if state.scope_remaining == 0 {
+            // Should not be called on exhausted token; return as-is
+            return state;
+        }
+        return CovenantState {
+            agent_pubkey_hash: state.agent_pubkey_hash,
+            scope_remaining: state.scope_remaining - 1,
+            capability_tag: state.capability_tag,
+            covenant_template_hash: state.covenant_template_hash,
+        };
+    }
+}
+
+// ─── BRC-100 integration ─────────────────────────────────────────────────────
+
+// BRC-100 "cop" (capability operation) token envelope.
+// This wraps the covenant locking script as an OP_RETURN metadata output
+// so the overlay network can index capability tokens.
+pub struct Brc100CapabilityToken {
+    pub covenant_state: CovenantState,
+    pub token_id: []u8,   // 32-byte random nonce, stable across transfers
+    pub issuer_pubkey: []u8,
+}
+
+impl Brc100CapabilityToken {
+    // Build the OP_FALSE OP_RETURN metadata script for BRC-100 indexing.
+    pub fn metadata_script(self) []u8 {
+        let mut script = []u8{};
+        // OP_FALSE OP_RETURN
+        script.push(0x00); // OP_0 / OP_FALSE
+        script.push(0x6a); // OP_RETURN
+
+        // BRC-100 cop prefix
+        script = push_data(script, BRC100_COP_PREFIX);
+        // Operation: mint_capability or transfer_capability
+        script = push_data(script, str_to_bytes("cop"));
+        // Token ID
+        script = push_data(script, self.token_id);
+        // Capability tag
+        script = push_data(script, str_to_bytes(self.covenant_state.capability_tag));
+        // Scope remaining (u32 LE)
+        script = push_data(script, u32_to_le_bytes(self.covenant_state.scope_remaining));
+        // Authorised agent HASH160
+        script = push_data(script, self.covenant_state.agent_pubkey_hash);
+        // Issuer pubkey
+        script = push_data(script, self.issuer_pubkey);
+
+        return script;
+    }
+
+    // Build the spendable covenant output (P2SH wrapping the covenant locking script).
+    pub fn covenant_script(self) []u8 {
+        return CovenantBuilder.build_locking_script(self.covenant_state);
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn compute_template_hash() []u8 {
+    // Hash of the static covenant body (without state params).
+    // In production this would be computed at CTFE from the raw script bytes.
+    let template_bytes = COVENANT_LOCKING_TEMPLATE.raw_bytes_without_params();
+    return hash.sha256(template_bytes);
+}
+
+fn u32_to_le_bytes(val: u32) []u8 {
+    return []u8{
+        u8(val & 0xff),
+        u8((val >> 8) & 0xff),
+        u8((val >> 16) & 0xff),
+        u8((val >> 24) & 0xff),
+    };
+}
+
+fn push_data(script: []u8, data: []u8) []u8 {
+    let mut out = script;
+    let len = data.len();
+    if len < 0x4c {
+        out.push(u8(len));
+    } else if len <= 0xff {
+        out.push(0x4c); // OP_PUSHDATA1
+        out.push(u8(len));
+    } else {
+        out.push(0x4d); // OP_PUSHDATA2
+        out.push(u8(len & 0xff));
+        out.push(u8((len >> 8) & 0xff));
+    }
+    out.append(data);
+    return out;
+}
+
+fn str_to_bytes(s: String) []u8 {
+    return s.as_bytes();
+}

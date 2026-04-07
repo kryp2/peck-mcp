@@ -6,6 +6,7 @@ import { sign_hex } from "./signer.zeta";
 import { build_p2pkh_tx_hex } from "./tx_builder.zeta";
 import { global_utxo_manager } from "./utxo.zeta";
 import { global_teranode } from "./broadcast.zeta";
+import { CovenantBuilder, CovenantState, Brc100CapabilityToken } from "./src/brc100/covenant.zeta";
 
 pub fn main() {
     let ctx = zmq.Context.new();
@@ -48,6 +49,136 @@ pub fn main() {
                 // get_utxos(address) → utxo_list
                 let address = req.get("address").as_string();
                 resp.set("utxo_list", global_utxo_manager.get_utxos(address));
+            },
+            // ── Covenant capability token commands ──────────────────────────
+            "build_covenant_mint_tx" => {
+                // Mint a new recursive covenant capability token UTXO.
+                // Params: issuer_privkey_hex, funding_utxo (JSON), agent_pubkey_hash_hex,
+                //         scope_remaining (u32), capability_tag, token_id_hex
+                let privkey_hex     = req.get("issuer_privkey_hex").as_string();
+                let funding_utxo    = req.get("funding_utxo").as_string();
+                let agent_hash_hex  = req.get("agent_pubkey_hash_hex").as_string();
+                let scope           = req.get("scope_remaining").as_u32();
+                let cap_tag         = req.get("capability_tag").as_string();
+                let template_hash   = req.get("covenant_template_hash_hex").as_string();
+                let token_id        = req.get("token_id_hex").as_string();
+
+                let state = CovenantState {
+                    agent_pubkey_hash:      hex.decode(agent_hash_hex),
+                    scope_remaining:        scope,
+                    capability_tag:         cap_tag,
+                    covenant_template_hash: hex.decode(template_hash),
+                };
+                let locking_script = CovenantBuilder.build_locking_script(state);
+
+                // Build tx: one P2SH-wrapped covenant output + one OP_RETURN metadata output
+                let token = Brc100CapabilityToken {
+                    covenant_state: state,
+                    token_id:       hex.decode(token_id),
+                    issuer_pubkey:  hex.decode(privkey_hex), // placeholder — would derive pubkey
+                };
+
+                // Sign with SIGHASH_OTDA (0x20) for Chronicle preimage access
+                let rawtx_hex = build_p2pkh_tx_hex(funding_utxo,
+                    json.stringify(map.of([
+                        ("type_",  "covenant"),
+                        ("script", hex.encode(locking_script)),
+                        ("meta",   hex.encode(token.metadata_script())),
+                    ]))
+                );
+                resp.set("rawtx_hex", rawtx_hex);
+            },
+            "build_covenant_spend_tx" => {
+                // Spend one capability use — recreates covenant with scope - 1.
+                // Params: agent_privkey_hex, covenant_utxo (JSON), current_scope,
+                //         new_scope, agent_pubkey_hash_hex, capability_tag, covenant_template_hash_hex
+                let privkey_hex    = req.get("agent_privkey_hex").as_string();
+                let covenant_utxo  = req.get("covenant_utxo").as_string();
+                let current_scope  = req.get("current_scope").as_u32();
+                let new_scope      = req.get("new_scope").as_u32();
+                let agent_hash_hex = req.get("agent_pubkey_hash_hex").as_string();
+                let cap_tag        = req.get("capability_tag").as_string();
+                let template_hash  = req.get("covenant_template_hash_hex").as_string();
+                let token_id       = req.get("token_id_hex").as_string();
+
+                // Validate state transition
+                if new_scope != current_scope - 1 {
+                    resp.set("error", "Invalid scope transition");
+                } else if current_scope == 0 {
+                    resp.set("error", "Token exhausted");
+                } else {
+                    let new_state = CovenantState {
+                        agent_pubkey_hash:      hex.decode(agent_hash_hex),
+                        scope_remaining:        new_scope,
+                        capability_tag:         cap_tag,
+                        covenant_template_hash: hex.decode(template_hash),
+                    };
+
+                    // Build unlocking script: <sig> <pubkey> <new_scope_le4>
+                    // (signature computed over OTDA preimage with sighash 0x20)
+                    let tx_hash  = sign_hex(privkey_hex, covenant_utxo); // mock hash
+                    let sig      = sign_hex(privkey_hex, tx_hash);
+                    // Derive pubkey from privkey (mocked — Zeta intrinsic)
+                    let pubkey_hex = privkey_hex; // placeholder
+
+                    let unlocking = CovenantBuilder.build_unlocking_script(
+                        hex.decode(sig),
+                        hex.decode(pubkey_hex),
+                        new_scope,
+                    );
+
+                    let new_locking = CovenantBuilder.build_locking_script(new_state);
+
+                    // Build spend tx with new covenant output (self-replication)
+                    let rawtx_hex = build_p2pkh_tx_hex(covenant_utxo,
+                        json.stringify(map.of([
+                            ("type_",     "covenant_spend"),
+                            ("unlocking", hex.encode(unlocking)),
+                            ("locking",   hex.encode(new_locking)),
+                            ("new_scope", new_scope.to_string()),
+                        ]))
+                    );
+                    resp.set("rawtx_hex", rawtx_hex);
+                }
+            },
+            "build_covenant_transfer_tx" => {
+                // Transfer covenant to a new authorised agent (same scope, new pubkey hash).
+                // Params: holder_privkey_hex, covenant_utxo, current_scope,
+                //         new_agent_pubkey_hash_hex, capability_tag, covenant_template_hash_hex
+                let privkey_hex       = req.get("holder_privkey_hex").as_string();
+                let covenant_utxo     = req.get("covenant_utxo").as_string();
+                let current_scope     = req.get("current_scope").as_u32();
+                let new_agent_hash    = req.get("new_agent_pubkey_hash_hex").as_string();
+                let cap_tag           = req.get("capability_tag").as_string();
+                let template_hash     = req.get("covenant_template_hash_hex").as_string();
+
+                let new_state = CovenantState {
+                    agent_pubkey_hash:      hex.decode(new_agent_hash),
+                    scope_remaining:        current_scope,
+                    capability_tag:         cap_tag,
+                    covenant_template_hash: hex.decode(template_hash),
+                };
+
+                let sig      = sign_hex(privkey_hex, covenant_utxo);
+                let pubkey_hex = privkey_hex; // placeholder
+
+                let unlocking = CovenantBuilder.build_unlocking_script(
+                    hex.decode(sig),
+                    hex.decode(pubkey_hex),
+                    current_scope, // scope unchanged on transfer
+                );
+                let new_locking = CovenantBuilder.build_locking_script(new_state);
+
+                let rawtx_hex = build_p2pkh_tx_hex(covenant_utxo,
+                    json.stringify(map.of([
+                        ("type_",     "covenant_transfer"),
+                        ("unlocking", hex.encode(unlocking)),
+                        ("locking",   hex.encode(new_locking)),
+                        ("scope",     current_scope.to_string()),
+                        ("new_agent", new_agent_hash),
+                    ]))
+                );
+                resp.set("rawtx_hex", rawtx_hex);
             },
             _ => {
                 resp.set("error", "Unknown command");
