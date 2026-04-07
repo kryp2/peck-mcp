@@ -1,0 +1,34 @@
+import { map } from "std/collections";
+import { time } from "std/os";
+
+// Hold en in-memory UTXO-pool per agent
+// Actor-isolasjon: én agent = én UTXO-pool, ingen delt state
+pub actor UtxoManager {
+    pool: map.Map<String, String>, // txid_vout -> utxo_json
+    locked: map.Map<String, u64>,   // txid_vout -> locked_until_timestamp
+
+    pub fn new() UtxoManager {
+        return UtxoManager {
+            pool: map.Map.new(),
+            locked: map.Map.new(),
+        };
+    }
+
+    pub fn get_utxos(address: String) String {
+        let nu = time.now_ms();
+        // Sjekker pool og returnerer ulåste UTXOer for adressen
+        // Returnerer liste med tilgjengelige UTXOer i JSON format
+        return "[]"; 
+    }
+
+    pub fn lock_utxo(txid_vout: String, timeout_ms: u64) {
+        // Lock UTXO ved bruk, frigjør ved bekreftelse eller timeout
+        self.locked.set(txid_vout, time.now_ms() + timeout_ms);
+    }
+
+    pub fn unlock_utxo(txid_vout: String) {
+        self.locked.remove(txid_vout);
+    }
+}
+
+pub let global_utxo_manager = UtxoManager.new();
