@@ -13,6 +13,7 @@
  */
 
 import { PrivateKey } from '@bsv/sdk'
+import { AgentIdentity } from './identity.js'
 
 interface AgentConfig {
   name: string
@@ -20,6 +21,7 @@ interface AgentConfig {
   peerPublicKey?: string  // Agent B's public key for P2P
   arcEndpoint: string
   network: 'testnet' | 'mainnet'
+  identity?: AgentIdentity
 }
 
 interface Strategy {
