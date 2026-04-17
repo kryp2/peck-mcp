@@ -923,3 +923,272 @@ a.peck-btn--ghost {
 .openrun-steps li {
   padding-block: 0.1rem !important;
 }
+
+/* ── All-time Bitcoin Schema ranking ──────────────── */
+.openrun-ranking {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 1rem 0 1.5rem;
+}
+.openrun-rank-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.openrun-rank-num {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--peck-muted);
+  min-width: 2.5rem;
+  font-variant-numeric: tabular-nums;
+}
+.openrun-rank-name {
+  font-weight: 600;
+  font-family: var(--peck-font-mono, ui-monospace, monospace);
+  flex: 1;
+}
+.openrun-rank-ours {
+  color: var(--peck-accent, #9cd96b);
+}
+.openrun-rank-other {
+  color: var(--peck-fg, #e8eaed);
+}
+.openrun-rank-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--peck-fg);
+  min-width: 8rem;
+  text-align: right;
+}
+.openrun-rank-age {
+  color: var(--peck-muted);
+  font-size: 0.85rem;
+  min-width: 8rem;
+}
+.openrun-rank-bar {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.openrun-rank-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+.openrun-rank-bar-fill.openrun-rank-ours {
+  background: var(--peck-accent, #9cd96b);
+}
+.openrun-rank-bar-fill.openrun-rank-other {
+  background: rgba(255, 255, 255, 0.25);
+}
+.openrun-rank-callout {
+  border: 1px solid var(--peck-accent, #9cd96b);
+  background: rgba(156, 217, 107, 0.07);
+  border-radius: 14px;
+  padding: 2rem;
+  text-align: center;
+  margin-top: 1rem;
+}
+.openrun-rank-headline {
+  margin: 0;
+  font-size: clamp(3rem, 8vw, 5rem);
+  font-weight: 700;
+  color: var(--peck-accent, #9cd96b);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.openrun-rank-sub {
+  margin: 0.5rem 0 0;
+  color: var(--peck-fg, #e8eaed);
+  font-size: 1rem;
+  max-width: 52ch;
+  margin-inline: auto;
+}
+
+/* ── Dynamic ranking bars — window vs post-window split ──── */
+.openrun-ranking-wrap {
+  margin: 1rem 0 1.5rem;
+}
+.openrun-rank-bar {
+  position: relative;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 0.4rem;
+}
+.openrun-rank-bar-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.5s ease-out;
+}
+.openrun-rank-bar-fill.openrun-rank-bar-window {
+  left: 0;
+  background: var(--peck-accent, #9cd96b);
+}
+.openrun-rank-bar-fill.openrun-rank-bar-post {
+  background: rgba(156, 217, 107, 0.35);
+  border-left: 1px solid rgba(11, 13, 14, 0.6);
+}
+.openrun-rank-bar-fill.openrun-rank-bar-other {
+  left: 0;
+  background: rgba(255, 255, 255, 0.25);
+}
+.openrun-rank-caption {
+  font-size: 0.88rem;
+  color: var(--peck-muted, #8b9299);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  min-width: 14rem;
+}
+.openrun-rank-window {
+  color: var(--peck-accent, #9cd96b);
+  font-weight: 600;
+}
+.openrun-rank-post {
+  color: var(--peck-fg, #e8eaed);
+  opacity: 0.75;
+}
+.openrun-rank-alltime {
+  color: var(--peck-fg, #e8eaed);
+  font-weight: 600;
+}
+.openrun-rank-sub-small {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--peck-muted, #8b9299);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ranking row head — grid for neat columns */
+.openrun-rank-row { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.9rem; }
+.openrun-rank-head {
+  display: grid;
+  grid-template-columns: 3rem 10rem 1fr auto;
+  gap: 1rem;
+  align-items: baseline;
+}
+.openrun-rank-age { font-size: 0.82rem; color: var(--peck-muted); white-space: nowrap; }
+.openrun-rank-caption { text-align: right; }
+@media (max-width: 680px) {
+  .openrun-rank-head { grid-template-columns: 2.5rem 1fr; grid-template-rows: auto auto; }
+  .openrun-rank-caption, .openrun-rank-age { grid-column: 1 / -1; text-align: left; }
+}
+
+/* ── Ranking LAYOUT: flexbox, explicit, with bars visible ──── */
+.openrun-rank-row {
+  display: block !important;
+  margin: 0 0 1.5rem 0 !important;
+  padding: 0 !important;
+}
+.openrun-rank-head {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: baseline !important;
+  gap: 1rem !important;
+  margin-bottom: 0.5rem !important;
+}
+.openrun-rank-num {
+  flex: 0 0 2.5rem !important;
+  font-weight: 700 !important;
+  color: var(--peck-muted) !important;
+  font-variant-numeric: tabular-nums !important;
+}
+.openrun-rank-name {
+  flex: 0 0 auto !important;
+  font-weight: 600 !important;
+  font-family: var(--peck-font-mono, ui-monospace, monospace) !important;
+  min-width: 9rem !important;
+}
+.openrun-rank-caption {
+  flex: 1 1 12rem !important;
+  text-align: right !important;
+  font-variant-numeric: tabular-nums !important;
+  color: var(--peck-muted) !important;
+  font-size: 0.9rem !important;
+}
+.openrun-rank-age {
+  flex: 0 0 auto !important;
+  color: var(--peck-muted) !important;
+  font-size: 0.82rem !important;
+  white-space: nowrap !important;
+  min-width: 9rem !important;
+  text-align: right !important;
+}
+
+/* Bars — must be visible */
+.openrun-rank-bar {
+  position: relative !important;
+  display: block !important;
+  height: 10px !important;
+  background: rgba(255, 255, 255, 0.05) !important;
+  border-radius: 5px !important;
+  overflow: hidden !important;
+  width: 100% !important;
+}
+.openrun-rank-bar-fill {
+  position: absolute !important;
+  top: 0 !important;
+  height: 100% !important;
+  display: block !important;
+  border-radius: 5px !important;
+  transition: width 0.5s ease-out !important;
+  min-width: 2px !important;
+}
+.openrun-rank-bar-fill.openrun-rank-bar-window {
+  left: 0 !important;
+  background: var(--peck-accent, #9cd96b) !important;
+}
+.openrun-rank-bar-fill.openrun-rank-bar-post {
+  background: rgba(156, 217, 107, 0.42) !important;
+  border-left: 1px solid #0b0d0e !important;
+}
+.openrun-rank-bar-fill.openrun-rank-bar-other {
+  left: 0 !important;
+  background: rgba(255, 255, 255, 0.28) !important;
+}
+
+@media (max-width: 680px) {
+  .openrun-rank-head {
+    gap: 0.5rem !important;
+  }
+  .openrun-rank-caption, .openrun-rank-age {
+    flex-basis: 100% !important;
+    text-align: left !important;
+  }
+}
+
+/* ── Voices from the graph ───────────────────────── */
+.openrun-voices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 1.25rem;
+  margin: 1rem 0 1.5rem;
+}
+.openrun-voice-card {
+  background: var(--peck-surface, #13171a);
+  border: 1px solid var(--peck-border, #2a2f33);
+  border-left: 3px solid var(--peck-accent, #9cd96b);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.openrun-voice-quote {
+  margin: 0;
+  font-size: 1.02rem;
+  line-height: 1.55;
+  color: var(--peck-fg, #e8eaed);
+  font-style: italic;
+}
+.openrun-voice-link {
+  margin: 0;
+  align-self: flex-start;
+  font-size: 0.78rem;
+}

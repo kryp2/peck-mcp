@@ -66,3 +66,6 @@ artifacts/
 # Local-dev fake service account (never commit — private key in JSON)
 infra/fake-sa.json
 infra/fake-sa.key
+__pycache__/
+*.pyc
+.gaps/

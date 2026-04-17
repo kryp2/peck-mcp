@@ -112,7 +112,7 @@ async function broadcastArc(rawHex: string): Promise<{ status: string; txid: str
   })
   const d = await r.json().catch(() => ({})) as any
   const status = String(d.txStatus || d.title || `http-${r.status}`)
-  const ok = ['SEEN_ON_NETWORK', 'ANNOUNCED_TO_NETWORK', 'STORED', 'MINED', 'SEEN_IN_ORPHAN_MEMPOOL'].includes(status)
+  const ok = ['SEEN_ON_NETWORK', 'ANNOUNCED_TO_NETWORK', 'STORED', 'MINED', 'SEEN_IN_ORPHAN_MEMPOOL', 'REQUESTED_BY_NETWORK', 'SENT_TO_NETWORK'].includes(status)
   if (!ok) throw new Error(`ARC rejected: ${status} ${JSON.stringify(d).slice(0, 400)}`)
   return { status, txid: d.txid || '' }
 }
