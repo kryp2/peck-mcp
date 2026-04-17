@@ -64,6 +64,21 @@ const mcpServer = new Server(
   { capabilities: { tools: {} } },
 )
 
+// Shared schema for deterministic P2PKH spend — used by all write-tools.
+// Client must supply a UTXO owned by their identity address; server never
+// auto-fetches (no wallet-toolbox, no WoC loop). Mirrors peck_tag_tx shape.
+const SPEND_UTXO_PROP = {
+  type: 'object' as const,
+  description: 'Current UTXO owned by the agent\'s P2PKH identity address. Pass {txid, vout, satoshis, rawTxHex} from a prior tx or peck_balance-derived lookup. Required — server will not auto-fetch.',
+  properties: {
+    txid: { type: 'string' },
+    vout: { type: 'number' },
+    satoshis: { type: 'number' },
+    rawTxHex: { type: 'string', description: 'Full raw hex of the source transaction.' },
+  },
+  required: ['txid', 'vout', 'satoshis', 'rawTxHex'],
+}
+
 const TOOLS = [
   // ─── READ tools (no auth needed) ───
   {
@@ -283,9 +298,10 @@ const TOOLS = [
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post to unlike.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key'],
+      required: ['target_txid', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -298,9 +314,10 @@ const TOOLS = [
       properties: {
         target_paymail: { type: 'string', description: 'The paymail/handle to unfollow (must match the follow target).' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_paymail', 'signing_key'],
+      required: ['target_paymail', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -317,9 +334,10 @@ const TOOLS = [
         target_bap_id: { type: 'string', description: 'BSV address (or BAP id) of the identity to friend.' },
         target_pubkey: { type: 'string', description: 'Optional compressed pubkey hex of the target — improves discoverability for encryption flows.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key'],
+      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -333,9 +351,10 @@ const TOOLS = [
       properties: {
         target_bap_id: { type: 'string', description: 'The bapID you previously friended.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key'],
+      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -350,9 +369,10 @@ const TOOLS = [
         target_txid: { type: 'string', description: 'Txid of the post to repost.' },
         content: { type: 'string', description: 'Your comment/quote (at least a short one is required for the tx to save).' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'content', 'signing_key'],
+      required: ['target_txid', 'content', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -380,9 +400,10 @@ const TOOLS = [
         recipient_pubkey: { type: 'string', description: 'Recipient identity pubkey (compressed hex). Optional — defaults to looking up via /v1/user/:address.' },
         encrypt: { type: 'boolean', description: 'Encrypt the DM with BRC-78. Defaults to true for DMs, ignored for channel/global.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['content', 'signing_key'],
+      required: ['content', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -400,9 +421,10 @@ const TOOLS = [
         bio: { type: 'string', description: 'Short bio / description.' },
         paymail: { type: 'string', description: 'Your paymail address (optional).' },
         signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['signing_key'],
+      required: ['signing_key', 'spend_utxo'],
     },
   },
   {
@@ -437,9 +459,10 @@ const TOOLS = [
         amount_sats: { type: 'number', description: 'Payment amount in satoshis (>= 1).' },
         recipient_address: { type: 'string', description: 'Optional — defaults to the post author resolved via /v1/post/:target_txid.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'amount_sats', 'signing_key'],
+      required: ['target_txid', 'amount_sats', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -540,9 +563,10 @@ const TOOLS = [
         signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for discovery.' },
         channel: { type: 'string', description: 'Optional channel.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['content', 'signing_key'],
+      required: ['content', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -555,9 +579,10 @@ const TOOLS = [
         content: { type: 'string', description: 'Reply content.' },
         parent_txid: { type: 'string', description: 'Txid of post to reply to.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['content', 'parent_txid', 'signing_key'],
+      required: ['content', 'parent_txid', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -568,9 +593,10 @@ const TOOLS = [
       properties: {
         target_txid: { type: 'string', description: 'Txid of post to like.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key'],
+      required: ['target_txid', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -615,9 +641,10 @@ const TOOLS = [
       properties: {
         target_pubkey: { type: 'string', description: 'Pubkey of who to follow.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_pubkey', 'signing_key'],
+      required: ['target_pubkey', 'signing_key', 'spend_utxo'],
     },
   },
 
@@ -636,9 +663,10 @@ const TOOLS = [
         args_schema: { type: 'string', description: 'JSON schema for args. E.g. {"prompt":"string"}' },
         price: { type: 'number', description: 'Price in satoshis per call.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'description', 'price', 'signing_key'],
+      required: ['name', 'description', 'price', 'signing_key', 'spend_utxo'],
     },
   },
   {
@@ -654,9 +682,10 @@ const TOOLS = [
         args: { type: 'string', description: 'JSON args string.' },
         provider_address: { type: 'string', description: 'AIP address of the function provider.' },
         signing_key: { type: 'string', description: 'Your privateKeyHex.' },
+        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'provider_address', 'signing_key'],
+      required: ['name', 'provider_address', 'signing_key', 'spend_utxo'],
     },
   },
   {
