@@ -1,0 +1,59 @@
+import { zmq } from "std/net";
+import { json } from "std/encoding";
+import { map } from "std/collections";
+
+import { sign_hex } from "./signer.zeta";
+import { build_p2pkh_tx_hex } from "./tx_builder.zeta";
+import { global_utxo_manager } from "./utxo.zeta";
+import { global_teranode } from "./broadcast.zeta";
+
+pub fn main() {
+    let ctx = zmq.Context.new();
+    let socket = ctx.socket(zmq.REP);
+    
+    // Eksponér følgende kommandoer over ZeroMQ til TypeScript
+    socket.bind("tcp://127.0.0.1:5555");
+    
+    // Initialiser Teranode WS
+    global_teranode.connect("wss://teranode.bsv.network/ws");
+    
+    println("Zeta Crypto Core lytter på ZeroMQ (port 5555)...");
+    
+    while true {
+        let msg = socket.recv_string();
+        let req = json.parse(msg);
+        let cmd = req.get("cmd").as_string();
+        
+        let mut resp = map.Map.new();
+        
+        match cmd {
+            "sign" => {
+                // sign(privkey_hex, data_hex) → sig_hex
+                let privkey_hex = req.get("privkey_hex").as_string();
+                let data_hex = req.get("data_hex").as_string();
+                resp.set("sig_hex", sign_hex(privkey_hex, data_hex));
+            },
+            "build_p2pkh_tx" => {
+                // build_p2pkh_tx(utxos, outputs) → rawtx_hex
+                let utxos = req.get("utxos").as_string();
+                let outputs = req.get("outputs").as_string();
+                resp.set("rawtx_hex", build_p2pkh_tx_hex(utxos, outputs));
+            },
+            "broadcast" => {
+                // broadcast(rawtx_hex) → txid
+                let rawtx_hex = req.get("rawtx_hex").as_string();
+                resp.set("txid", global_teranode.broadcast(rawtx_hex));
+            },
+            "get_utxos" => {
+                // get_utxos(address) → utxo_list
+                let address = req.get("address").as_string();
+                resp.set("utxo_list", global_utxo_manager.get_utxos(address));
+            },
+            _ => {
+                resp.set("error", "Unknown command");
+            }
+        }
+        
+        socket.send_string(json.stringify(resp));
+    }
+}

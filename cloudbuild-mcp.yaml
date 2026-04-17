@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - Dockerfile.mcp
+      - -t
+      - 'europe-west1-docker.pkg.dev/gen-lang-client-0447933194/cloud-run-source-deploy/peck-mcp:latest'
+      - .
+images:
+  - 'europe-west1-docker.pkg.dev/gen-lang-client-0447933194/cloud-run-source-deploy/peck-mcp:latest'

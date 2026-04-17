@@ -1,0 +1,10 @@
+node_modules
+.git
+.peck-state
+.ladder-state
+.wallets.json
+.wallets-mainnet.json
+.wallets-services.json
+.wallets-economy.json
+dist
+*.log
