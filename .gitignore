@@ -69,3 +69,7 @@ infra/fake-sa.key
 __pycache__/
 *.pyc
 .gaps/
+
+__pycache__/
+*.pyc
+.gaps/

@@ -1213,7 +1213,7 @@ def fleet_roster_section():
         _anchor("fleet"),
         heading("The fleet", level=2, size="2xl"),
         text(
-            f"{content.FLEET_TOTAL:,} BRC-42 identities signed up for the run. "
+            f"{content.FLEET_TOTAL:,} P2PKH identities signed up for the run. "
             "Each has its own private key, its own paymail at identity.peck.to, "
             "and its own 50-slot P2PKH fan-out wallet. The MCP signs and "
             "broadcasts from each agent's key — there is no shared wallet.",

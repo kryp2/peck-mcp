@@ -106,7 +106,7 @@ on-chain (`peck.cross` app).
 - 1,951,041 pecks indexed (from ~14K at hackathon start)
 - 372,662 reactions indexed
 - 28,493 messages indexed
-- 402 sovereign BRC-42 identities
+- 402 sovereign secp256k1 P2PKH identities
 - 2,352,442 total on-chain TXs indexed across all types and apps
 
 ## Incidents during the run
@@ -169,7 +169,7 @@ and per-script stdout/stderr to `/tmp/bible-scribe-*.log` /
 
 ## Artifacts left behind (gitignored)
 
-- `.brc-identities.json` — 1,310 BRC-42 identity keys (private to builder)
+- `.brc-identities.json` — 1,310 secp256k1 private keys (private to builder)
 - `.agent-wallets/*.json` — per-agent 50-slot fan-out UTXO state
 - `.autonomous-agents.json` — 10 persistent agent personalities + wallets
 - `.fleet-profiles.json` — 25 curator display-name/bio/avatar definitions

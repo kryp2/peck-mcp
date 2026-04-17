@@ -108,7 +108,7 @@ INFRA = [
 ]
 
 # ── The fleet roster ─────────────────────────────────────────────
-# Every BRC-42 identity in .brc-identities.json grouped by role prefix.
+# Every secp256k1 identity in .brc-identities.json grouped by role prefix.
 # Each agent has its own privkey + paymail; each broadcasts its own signed
 # Bitcoin Schema transactions. Total: 1,310 identities + 10 autonomous +
 # 25 fleet-profile curators = 1,345 agents registered for the run.
@@ -405,7 +405,7 @@ TIMELINE = [
 ]
 
 # ── Ground-truth fleet count (per-author query) ──────────────────
-# Every BRC-42 identity + autonomous agent + wallet has a known P2PKH
+# Every agent identity + autonomous agent + wallet has a known P2PKH
 # address. We queried overlay.peck.to/v1/feed?author=<addr>&limit=1
 # for each of 1,322 addresses on 2026-04-17 and summed `total`.
 # Judges can reproduce by clicking any row below — peck.to/u/<addr>
