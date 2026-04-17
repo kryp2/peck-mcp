@@ -10,7 +10,6 @@ RUN npm ci --production=false
 
 # Copy source
 COPY src/ src/
-COPY artifacts/ artifacts/
 COPY tsconfig.json ./
 COPY .env* ./
 
