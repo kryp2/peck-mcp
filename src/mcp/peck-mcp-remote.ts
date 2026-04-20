@@ -24,6 +24,8 @@ import {
 import { randomUUID, randomBytes } from 'crypto'
 import { PrivateKey, PublicKey, Transaction, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
 import { createHash } from 'crypto'
+import pg from 'pg'
+import Redis from 'ioredis'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -1019,6 +1021,165 @@ async function arcBroadcast(rawHex: string): Promise<{ ok: boolean; txid: string
   return { ok, txid: body.txid || '', status, body }
 }
 
+// ─── Optimistic mempool indexing (direct DB write) ──────────────────────────
+// After ARC accepts a write, insert a pecks row with block_height=0 so callers
+// can see their own post/reply/repost immediately — and so chained replies
+// within the same block can resolve their parent. Mirrors peck-indexer-go's
+// savePost verbatim (same SQL, same ON CONFLICT): the upsert preserves any
+// existing non-empty content, so indexer-go's later authoritative write wins
+// on any disagreement. We never pass empty content, so the update is a no-op
+// when indexer-go has already written (ARC round-trip vs JungleBus race).
+//
+// We do NOT route through overlay /submit-tx: parseScript there had a dialect
+// mismatch for peck.cross scribe scripts that wrote the MAP JSON envelope into
+// the content column. By building PeckMeta in the tool handler (where the
+// caller already passed us content/tags/parent_txid/etc.) we skip parsing
+// entirely and store exactly what was broadcast.
+type PeckMeta = {
+  txid: string
+  type: 'post' | 'reply' | 'repost'
+  content: string
+  mediaType?: string | null
+  app: string
+  author: string
+  parentTxid?: string | null
+  refTxid?: string | null
+  channel?: string | null
+  tags?: string[] | null
+  aipVerified?: boolean
+}
+
+// ============================================================================
+// Redis broadcast-queue — shared med peck-web. MCP XADDer BEEF hit i stedet
+// for å kalle ARC direkte. Broadcaster-service konsumerer streamen, submitter
+// til overlay, og oppdaterer tx_status. Gir oss samme retry/admission-check/
+// metrics som peck-web.
+// ============================================================================
+const REDIS_HOST = process.env.REDIS_HOST || ''
+let _redis: Redis | null | undefined
+function getRedis(): Redis | null {
+  if (_redis !== undefined) return _redis
+  if (!REDIS_HOST) {
+    _redis = null
+    return null
+  }
+  _redis = new Redis({
+    host: REDIS_HOST,
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    maxRetriesPerRequest: 1,
+    connectTimeout: 2000,
+    lazyConnect: true,
+  })
+  _redis.connect().then(() => console.log(`[mcp] Redis connected: ${REDIS_HOST}`))
+    .catch(e => { _redis = null; console.error('[mcp] Redis unavailable:', e?.message) })
+  return _redis
+}
+
+/**
+ * Legger BEEF i broadcast-queue + skriver tx_status=pending.
+ * Erstatter direkte arcBroadcast + dbSavePost — overlay blir canonical writer
+ * til pecks via broadcaster-workerens pipeline.
+ * Returnerer umiddelbart; broadcast/admission skjer asynkront.
+ */
+async function enqueueBroadcast(beefHex: string, txid: string, topics: string[] = ['peck-schema']): Promise<void> {
+  const pool = getPgPool()
+  const redis = getRedis()
+  // tx_status INSERT (idempotent)
+  if (pool) {
+    try {
+      await pool.query(`
+        INSERT INTO tx_status (txid, state, beef_hex, topics, created_at, updated_at)
+        VALUES ($1, 'pending', $2, $3, NOW(), NOW())
+        ON CONFLICT (txid) DO NOTHING
+      `, [txid, beefHex, JSON.stringify(topics)])
+    } catch (e: any) {
+      console.error(`[mcp-enqueue] tx_status insert failed for ${txid.slice(0, 12)}:`, e?.message)
+    }
+  }
+  // Redis XADD til broadcast-queue
+  if (redis) {
+    try {
+      const payload = JSON.stringify({ txid, beef_hex: beefHex, topics, attempt: 0 })
+      await redis.xadd('broadcast-queue', 'MAXLEN', '~', '100000', '*', 'payload', payload)
+    } catch (e: any) {
+      console.error(`[mcp-enqueue] XADD failed for ${txid.slice(0, 12)}:`, e?.message)
+      throw e // Hvis Redis feiler vil vi at broadcastScript returnerer feil
+    }
+  } else {
+    throw new Error('Redis unavailable — cannot enqueue broadcast')
+  }
+}
+
+let _pgPool: pg.Pool | null | undefined
+function getPgPool(): pg.Pool | null {
+  if (_pgPool !== undefined) return _pgPool
+  const host = process.env.DB_HOST
+  const user = process.env.DB_USER
+  const password = process.env.DB_PASSWORD || process.env.DB_PASS
+  const database = process.env.DB_NAME
+  if (!host || !user || !password || !database) {
+    _pgPool = null
+    return null
+  }
+  // Cloud Run Cloud SQL integration mounts the Unix socket at
+  // /cloudsql/<instance>. pg uses host+port to form the socket path
+  // /cloudsql/<instance>/.s.PGSQL.<port>, so port must still be set.
+  _pgPool = new pg.Pool({
+    host, user, password, database,
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    max: 4,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  })
+  _pgPool.on('error', (e) => console.error('[pg-pool] idle client error:', e?.message || e))
+  return _pgPool
+}
+
+// peck-indexer-go/db.go:390 savePost. Copied verbatim so a later indexer-go
+// write cannot overwrite our optimistic row with anything worse.
+const SAVE_POST_SQL = `
+  INSERT INTO pecks (
+    txid, type, content, map_content, media_type, filename,
+    app, author, display_name, parent_txid, ref_txid,
+    channel, timestamp, block_height, tags, aip_verified
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+  ON CONFLICT (txid) DO UPDATE SET
+    block_height = EXCLUDED.block_height,
+    content = COALESCE(NULLIF(EXCLUDED.content, ''), pecks.content),
+    map_content = COALESCE(NULLIF(EXCLUDED.map_content, ''), pecks.map_content),
+    media_type = COALESCE(NULLIF(EXCLUDED.media_type, ''), pecks.media_type),
+    filename = COALESCE(EXCLUDED.filename, pecks.filename),
+    display_name = COALESCE(EXCLUDED.display_name, pecks.display_name),
+    parent_txid = COALESCE(pecks.parent_txid, EXCLUDED.parent_txid),
+    ref_txid = COALESCE(pecks.ref_txid, EXCLUDED.ref_txid),
+    channel = COALESCE(pecks.channel, EXCLUDED.channel),
+    tags = COALESCE(NULLIF(EXCLUDED.tags, ''), pecks.tags),
+    aip_verified = EXCLUDED.aip_verified OR pecks.aip_verified
+`
+
+async function dbSavePost(meta: PeckMeta): Promise<void> {
+  const pool = getPgPool()
+  if (!pool) return
+  try {
+    // Mirror peck-indexer-go/parser.go:715 — map_content falls back to B-content
+    // when Map.Content is absent. Scribe scripts only push B, so we match that.
+    const mapContent = meta.content
+    const mediaType = meta.mediaType || 'text/markdown'
+    const tags = meta.tags && meta.tags.length ? meta.tags.join(',') : null
+    const parentTxid = meta.type === 'reply' ? (meta.parentTxid || null) : null
+    const refTxid = meta.type === 'repost' ? (meta.refTxid || null) : null
+    const channel = meta.channel || null
+    const aipVerified = meta.aipVerified !== false
+    await pool.query(SAVE_POST_SQL, [
+      meta.txid, meta.type, meta.content, mapContent, mediaType, null,
+      meta.app, meta.author, null, parentTxid, refTxid,
+      channel, new Date(), 0, tags, aipVerified,
+    ])
+  } catch (e: any) {
+    console.error(`[db-save-post] ${meta.txid.slice(0, 12)}… failed:`, e?.message || e)
+  }
+}
+
 function arcBroadcastAsync(rawHex: string, txid: string): void {
   fetch(ARC_WRITE_URL, {
     method: 'POST',
@@ -1027,7 +1188,17 @@ function arcBroadcastAsync(rawHex: string, txid: string): void {
   }).catch(e => console.error(`[arc-async] ${txid.slice(0, 12)} broadcast failed:`, e.message))
 }
 
-async function broadcastScript(script: Script, key: PrivateKey, spend?: SpendUtxo): Promise<string> {
+// Meta-builder: caller passes a PeckMetaPartial without txid (unknown before
+// signing); broadcastScript fills it in after signing. Omit the arg entirely
+// for non-content writes (like/follow/tag) — no pecks row should exist.
+type PeckMetaPartial = Omit<PeckMeta, 'txid'>
+
+async function broadcastScript(
+  script: Script,
+  key: PrivateKey,
+  spend?: SpendUtxo,
+  meta?: PeckMetaPartial,
+): Promise<string> {
   if (!validateSpendUtxo(spend)) {
     return JSON.stringify({ error: 'spend_utxo required: {txid, vout, satoshis, rawTxHex}' })
   }
@@ -1036,12 +1207,15 @@ async function broadcastScript(script: Script, key: PrivateKey, spend?: SpendUtx
     await built.tx.sign()
     const txid = built.tx.id('hex') as string
     const rawHex = built.tx.toHex()
-    const r = await arcBroadcast(rawHex)
-    if (!r.ok) {
-      return JSON.stringify({ success: false, txid, status: r.status, error: r.body.detail || 'broadcast rejected', body: r.body }, null, 2)
-    }
+    // BEEF-format for overlay. Returner også rawHex fordi agenter fortsatt
+    // trenger den som `new_utxo.rawTxHex` for chained spending (zero-conf).
+    const beefHex = built.tx.toHexBEEF()
+    // Async enqueue: broadcaster-worker submitter til overlay, overlay
+    // skriver til pecks/reactions via lookup-service. Agent får txid
+    // umiddelbart — ingen venting på overlay/ARC.
+    await enqueueBroadcast(beefHex, txid)
     return JSON.stringify({
-      success: true, txid, status: r.status,
+      success: true, txid, status: 'queued',
       peck_to: `https://peck.to/tx/${txid}`,
       new_utxo: { txid, vout: built.changeVout, satoshis: built.change, rawTxHex: rawHex },
       fee: built.fee,
@@ -1341,8 +1515,13 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         try {
           const key = PrivateKey.fromHex(signingKey)
           const appName = args?.agent_app || 'peck.agents'
+          const author = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
           const script = buildRepost(String(args.content), String(args.target_txid), key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const meta: PeckMetaPartial = {
+            type: 'repost', content: String(args.content), app: appName, author,
+            refTxid: String(args.target_txid),
+          }
+          text = await broadcastScript(script, key, args?.spend_utxo, meta)
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1635,17 +1814,29 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         try {
           const key = PrivateKey.fromHex(signingKey)
           const appName = args?.agent_app || 'peck.agents'
+          const author = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
           let script: Script
+          let meta: PeckMetaPartial | undefined
           if (name === 'peck_post_tx') {
             script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: key, app: appName })
+            meta = {
+              type: 'post', content: String(args?.content || ''), app: appName, author,
+              channel: args?.channel ? String(args.channel) : null,
+              tags: Array.isArray(args?.tags) ? args.tags.map(String) : null,
+            }
           } else if (name === 'peck_reply_tx') {
             script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: key, app: appName })
+            meta = {
+              type: 'reply', content: String(args?.content || ''), app: appName, author,
+              parentTxid: args?.parent_txid ? String(args.parent_txid) : null,
+              tags: Array.isArray(args?.tags) ? args.tags.map(String) : null,
+            }
           } else if (name === 'peck_like_tx') {
             script = buildMapOnly('like', { tx: args?.target_txid }, key, appName)
           } else {
             script = buildMapOnly('follow', { bapID: args?.target_pubkey }, key, appName)
           }
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          text = await broadcastScript(script, key, args?.spend_utxo, meta)
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
