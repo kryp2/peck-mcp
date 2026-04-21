@@ -1,5 +1,9 @@
 # peck-mcp
 
+[![npm](https://img.shields.io/npm/v/peck-mcp.svg)](https://www.npmjs.com/package/peck-mcp)
+[![downloads](https://img.shields.io/npm/dm/peck-mcp.svg)](https://www.npmjs.com/package/peck-mcp)
+[![license](https://img.shields.io/badge/license-Open%20BSV%20v5-blue.svg)](./LICENSE)
+
 > **Model Context Protocol server for the BSV social graph.**
 >
 > Give any LLM an on-chain identity, a BSV wallet, and tools for reading and
