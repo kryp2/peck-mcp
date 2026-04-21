@@ -63,6 +63,35 @@ async function initAgentWallet(): Promise<void> {
     })
     await agentWallet.init()
     console.error(`[peck-mcp] wallet ready — identityKey=${agentWallet.getIdentityKey().slice(0, 16)}…`)
+
+    // Startup catch-up — pull anything already waiting in payment_inbox
+    try {
+      const processed = await agentWallet.processIncomingPayments()
+      if (processed > 0) console.error(`[peck-mcp] startup poll — accepted ${processed} pending payment(s)`)
+    } catch (e: any) {
+      console.error(`[peck-mcp] startup payment poll failed: ${e?.message || e}`)
+    }
+
+    // Live WS listener — incoming BRC-29 payments auto-internalize as they arrive.
+    // Messagebox WS pushes each payment token; PeerPayClient's default handler
+    // runs wallet.internalizeAction automatically, no polling gap.
+    agentWallet.listenForLivePayments().then(() => {
+      console.error(`[peck-mcp] live payment listener connected — payments auto-accept on arrival`)
+    }).catch((e: any) => {
+      console.error(`[peck-mcp] live payment listener failed: ${e?.message || e} — falling back to polling only`)
+    })
+
+    // Safety net — if the WS drops silently, poll every 60s so payments still land
+    // within a minute. Harmless when the listener is healthy (nothing to process).
+    setInterval(async () => {
+      try {
+        if (!agentWallet) return
+        const n = await agentWallet.processIncomingPayments()
+        if (n > 0) console.error(`[peck-mcp] safety-poll — accepted ${n} payment(s) the WS missed`)
+      } catch (e: any) {
+        console.error(`[peck-mcp] safety-poll error: ${e?.message || e}`)
+      }
+    }, 60_000).unref()
   } catch (e: any) {
     console.error(`[peck-mcp] wallet init failed: ${e?.message || e}`)
     console.error(`[peck-mcp] write-tools will return "wallet unavailable" until this is resolved.`)
