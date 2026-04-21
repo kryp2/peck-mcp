@@ -12,6 +12,10 @@ Case study: [`openrun.peck.to`](https://openrun.peck.to)
 
 ---
 
+## Hackathon submission
+
+The exact commit judged for [Open Run Agentic Pay](https://hackathon.bsvb.tech/) on 2026-04-17 is tagged **[`submission-2026-04-17`](https://github.com/kryp2/peck-mcp/releases/tag/submission-2026-04-17)**. See the delta since submission with `git log submission-2026-04-17..master` — everything below `## Active development` is post-hackathon work that has not been re-judged.
+
 ## Active development
 
 **`master` = stable, public, what `mcp.peck.to` runs.**
