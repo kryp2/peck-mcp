@@ -2,7 +2,7 @@
  * Peck MCP Remote — read + write BRC-100 social graph.
  *
  * MCP owns its own BRC-100 identity (loaded from OS keychain via
- * peck-agent-wallet). Every write routes through @bsv/wallet-toolbox's
+ * bitcoin-agent-wallet). Every write routes through @bsv/wallet-toolbox's
  * createAction — UTXO selection, ancestor BEEF assembly, signing, and ARC
  * submission all happen inside the wallet. Callers do NOT pass keys or
  * UTXOs. MAP `app` field distinguishes which CLI posted.
@@ -26,7 +26,7 @@ import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv
 import { createHash } from 'crypto'
 import { homedir } from 'os'
 import { join } from 'path'
-import { PeckAgentWallet, getOrMigrateIdentityKey } from 'peck-agent-wallet'
+import { BitcoinAgentWallet, getOrMigrateIdentityKey } from 'bitcoin-agent-wallet'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -45,14 +45,14 @@ const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
 // responsibility — MCP never polls UTXOs or hand-rolls P2PKH.
 // ============================================================================
 
-let agentWallet: PeckAgentWallet | null = null
+let agentWallet: BitcoinAgentWallet | null = null
 let agentKey: PrivateKey | null = null   // used by Bitcoin Schema script builders (AIP signing)
 
 async function initAgentWallet(): Promise<void> {
   try {
     const privateKeyHex = await getOrMigrateIdentityKey()
     agentKey = PrivateKey.fromHex(privateKeyHex)
-    agentWallet = new PeckAgentWallet({
+    agentWallet = new BitcoinAgentWallet({
       privateKeyHex,
       network: NETWORK as 'main' | 'test',
       appName: APP_NAME,
@@ -552,7 +552,7 @@ const TOOLS = [
   },
 
   // ─── WRITE tools ───
-  // MCP owns its own BRC-100 identity (loaded from OS keychain via peck-agent-wallet).
+  // MCP owns its own BRC-100 identity (loaded from OS keychain via bitcoin-agent-wallet).
   // Every write goes through wallet-toolbox's createAction — UTXO selection, ancestor
   // BEEF assembly, signing, and ARC submission all happen inside the wallet. Callers
   // do NOT supply keys or UTXOs; install peck-mcp locally if you need writes.
@@ -1429,13 +1429,13 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           wallet_ready: walletReady,
           identity_key: identityKey,
           address,
-          storage: 'OS keychain (libsecret / Keychain / Credential Manager) via peck-agent-wallet',
+          storage: 'OS keychain (libsecret / Keychain / Credential Manager) via bitcoin-agent-wallet',
           setup_instructions: walletReady
             ? ['Identity ready. Fund the address above to enable writes.']
             : [
               '1. Install peck-mcp locally (keychain access requires a local install, not the hosted mcp.peck.to).',
               '2. First run auto-migrates any legacy ~/.peck/identity.json into the OS keychain.',
-              '3. Otherwise generate a fresh key: `node -e "import(\'peck-agent-wallet\').then(({storeIdentityKey}) => import(\'@bsv/sdk\').then(({PrivateKey}) => storeIdentityKey(PrivateKey.fromRandom().toHex())))"`',
+              '3. Otherwise generate a fresh key: `node -e "import(\'bitcoin-agent-wallet\').then(({storeIdentityKey}) => import(\'@bsv/sdk\').then(({PrivateKey}) => storeIdentityKey(PrivateKey.fromRandom().toHex())))"`',
               '4. Restart peck-mcp — it will load the key from keychain on boot.',
             ],
           usage: {
@@ -1505,7 +1505,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
 
-      // ─── WRITE (build Bitcoin Schema script + broadcast via peck-agent-wallet) ───
+      // ─── WRITE (build Bitcoin Schema script + broadcast via bitcoin-agent-wallet) ───
       case 'peck_post_tx':
       case 'peck_reply_tx':
       case 'peck_like_tx':
@@ -1548,7 +1548,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
 
-      // ─── TAG (Bitcoin Schema retroactive tag, broadcast via peck-agent-wallet) ───
+      // ─── TAG (Bitcoin Schema retroactive tag, broadcast via bitcoin-agent-wallet) ───
       case 'peck_tag_tx': {
         if (!agentWallet || !agentKey) {
           text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
@@ -1732,9 +1732,9 @@ const httpServer = createServer(async (req, res) => {
         cost_model:
           'Reads (peck_feed, peck_recent, peck_search, peck_thread, peck_profile, peck_chain_tip, etc.) are free. Writes (peck_post_tx, peck_reply_tx, peck_like_tx, peck_message_tx, peck_payment_tx, peck_function_*) cost ~1 satoshi in mining fees per TX, spent from a UTXO owned by the MCP-resident agent identity. peck_payment_tx and peck_function_call additionally send the amount you specify to the recipient.',
         where_my_key_comes_from:
-          "peck-mcp loads its BRC-100 identity from the OS keychain on boot (via peck-agent-wallet). First run auto-migrates legacy ~/.peck/identity.json into libsecret / Keychain / Credential Manager. Writes only work when peck-mcp is installed locally with keychain access — the hosted mcp.peck.to returns 'wallet unavailable' for writes.",
+          "peck-mcp loads its BRC-100 identity from the OS keychain on boot (via bitcoin-agent-wallet). First run auto-migrates legacy ~/.peck/identity.json into libsecret / Keychain / Credential Manager. Writes only work when peck-mcp is installed locally with keychain access — the hosted mcp.peck.to returns 'wallet unavailable' for writes.",
         funding:
-          'A new address starts at 0 sats. Reads work immediately; writes need a BRC-29 payment to the agent identity. Get sats by asking a peck.to user to tip your address, or by calling peck-agent-wallet.requestPayment() from another BRC-100 wallet you control.',
+          'A new address starts at 0 sats. Reads work immediately; writes need a BRC-29 payment to the agent identity. Get sats by asking a peck.to user to tip your address, or by calling bitcoin-agent-wallet.requestPayment() from another BRC-100 wallet you control.',
       },
       protocol:
         'Model Context Protocol (MCP) over StreamableHTTP — https://modelcontextprotocol.io/',
@@ -1747,7 +1747,7 @@ const httpServer = createServer(async (req, res) => {
       },
       writes: {
         chain: NETWORK === 'main' ? 'BSV mainnet' : `BSV ${NETWORK}`,
-        broadcaster: 'wallet-toolbox createAction → ARC (via peck-agent-wallet)',
+        broadcaster: 'wallet-toolbox createAction → ARC (via bitcoin-agent-wallet)',
         format: 'Bitcoin Schema (MAP + B + AIP) — https://bitcoinschema.org/',
         signing:
           'MCP owns its own BRC-100 identity loaded from the OS keychain. wallet-toolbox handles UTXO-selection, ancestor BEEF assembly, signing, and broadcast — callers never supply keys or UTXOs.',
@@ -1757,7 +1757,7 @@ const httpServer = createServer(async (req, res) => {
         latency: 'sub-100ms for feed reads',
       },
       identity:
-        "Agent identity is keychain-resident (peck-agent-wallet). Same key continues to work against peck.to's human web frontend.",
+        "Agent identity is keychain-resident (bitcoin-agent-wallet). Same key continues to work against peck.to's human web frontend.",
       docs: 'https://docs.peck.to',
     }))
   }
