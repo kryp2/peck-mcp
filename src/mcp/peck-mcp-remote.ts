@@ -22,7 +22,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js'
 import { randomUUID, randomBytes } from 'crypto'
-import { PrivateKey, PublicKey, Transaction, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
+import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
 import { createHash } from 'crypto'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -102,21 +102,6 @@ const mcpServer = new Server(
   { name: 'peck-mcp', version: '3.1.0' },
   { capabilities: { tools: {} } },
 )
-
-// Shared schema for deterministic P2PKH spend — used by all write-tools.
-// Client must supply a UTXO owned by their identity address; server never
-// auto-fetches (no wallet-toolbox, no WoC loop). Mirrors peck_tag_tx shape.
-const SPEND_UTXO_PROP = {
-  type: 'object' as const,
-  description: 'Current UTXO owned by the agent\'s P2PKH identity address. Pass {txid, vout, satoshis, rawTxHex} from a prior tx or peck_balance-derived lookup. Required — server will not auto-fetch.',
-  properties: {
-    txid: { type: 'string' },
-    vout: { type: 'number' },
-    satoshis: { type: 'number' },
-    rawTxHex: { type: 'string', description: 'Full raw hex of the source transaction.' },
-  },
-  required: ['txid', 'vout', 'satoshis', 'rawTxHex'],
-}
 
 const TOOLS = [
   // ─── READ tools (no auth needed) ───
@@ -921,164 +906,6 @@ function buildMapOnly(type: string, fields: Record<string, string>, signingKey: 
   const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey)
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
-}
-
-// ============================================================================
-// Deterministic P2PKH broadcast primitive.
-//
-// Every write-tool in MCP routes through this. No wallet-toolbox, no Monitor,
-// no optimistic retry. Client passes spend_utxo {txid,vout,satoshis,rawTxHex}.
-// We build the tx, sign with agent key, broadcast DIRECTLY to ARC GorillaPool,
-// and return success + new_utxo ONLY if ARC confirms SEEN_ON_NETWORK.
-//
-// Truthful: the txid we return IS the txid on chain. No mutation, no lies.
-// Client is responsible for persisting new_utxo and driving the chain.
-// ============================================================================
-
-interface SpendUtxo {
-  txid: string
-  vout: number
-  satoshis: number
-  rawTxHex: string
-}
-
-// Legacy GorillaPool ARC — proven mainnet path. Arcade (Teranode-backed)
-// rejected our TXs with 467 + 404 on known-mined mainnet TXs; appears to
-// not share mempool/index with mainnet. ARC_WRITE_URL env overrides.
-const ARC_WRITE_URL = process.env.ARC_WRITE_URL
-  || (NETWORK === 'main' ? 'https://arc.gorillapool.io/v1/tx' : 'https://arc-test.taal.com/v1/tx')
-
-function validateSpendUtxo(u: any): u is SpendUtxo {
-  return !!u && typeof u.txid === 'string' && typeof u.vout === 'number'
-    && typeof u.satoshis === 'number' && typeof u.rawTxHex === 'string'
-}
-
-// ============================================================================
-// Broadcast helpers — P2PKH deterministic, direct ARC
-// ============================================================================
-
-function buildChainTx(
-  script: Script,
-  key: PrivateKey,
-  spend: SpendUtxo,
-  extraOutputs: Array<{ lockingScript: Script; satoshis: number }> = [],
-): { tx: Transaction; rawHex: string; txid: string; fee: number; change: number; changeVout: number } {
-  const addr = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const parent = Transaction.fromHex(spend.rawTxHex)
-
-  const tx = new Transaction()
-  tx.addInput({
-    sourceTransaction: parent,
-    sourceOutputIndex: spend.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(key),
-  })
-  tx.addOutput({ lockingScript: script, satoshis: 0 })
-  let extraSats = 0
-  for (const o of extraOutputs) {
-    tx.addOutput({ lockingScript: o.lockingScript, satoshis: o.satoshis })
-    extraSats += o.satoshis
-  }
-
-  const lockHex = script.toHex()
-  const extraSize = extraOutputs.reduce((s, o) => s + o.lockingScript.toHex().length / 2 + 10, 0)
-  const estSize = 10 + 148 + 10 + lockHex.length / 2 + extraSize + 34
-  const fee = Math.max(20, Math.ceil(estSize * 100 / 1000)) + 1
-  const change = spend.satoshis - extraSats - fee
-  if (change < 1) throw new Error(`insufficient funds: ${spend.satoshis} − ${extraSats} − ${fee} fee = ${change}`)
-  tx.addOutput({ lockingScript: new P2PKH().lock(addr), satoshis: change })
-  const changeVout = 1 + extraOutputs.length
-  return { tx, rawHex: '', txid: '', fee, change, changeVout }
-}
-
-// ARC success-state progression: QUEUED → RECEIVED → STORED → ANNOUNCED_TO_NETWORK
-// → REQUESTED_BY_NETWORK → SENT_TO_NETWORK → ACCEPTED_BY_NETWORK → SEEN_ON_NETWORK → MINED.
-// Anything in that progression means the tx was accepted — treat as ok.
-const ARC_OK_STATES = new Set([
-  'ANNOUNCED_TO_NETWORK',
-  'REQUESTED_BY_NETWORK',
-  'SENT_TO_NETWORK',
-  'ACCEPTED_BY_NETWORK',
-  'SEEN_ON_NETWORK',
-  'MINED',
-  'CONFIRMED',
-])
-
-async function arcBroadcast(rawHex: string): Promise<{ ok: boolean; txid: string; status: string; body: any }> {
-  const isGorilla = ARC_WRITE_URL.includes('gorillapool')
-  const taalKey = process.env.MAIN_TAAL_API_KEY || process.env.TAAL_MAINNET_KEY || ''
-  const r = await fetch(ARC_WRITE_URL, {
-    method: 'POST',
-    headers: isGorilla
-      ? { 'Content-Type': 'application/octet-stream' }
-      : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${taalKey}` },
-    body: isGorilla ? Buffer.from(rawHex, 'hex') : JSON.stringify({ rawTx: rawHex }),
-  })
-  const body = await r.json().catch(() => ({})) as any
-  const status = body.txStatus || body.status || `http-${r.status}`
-  const ok = r.ok && ARC_OK_STATES.has(status)
-  return { ok, txid: body.txid || '', status, body }
-}
-
-function arcBroadcastAsync(rawHex: string, txid: string): void {
-  fetch(ARC_WRITE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: Buffer.from(rawHex, 'hex'),
-  }).catch(e => console.error(`[arc-async] ${txid.slice(0, 12)} broadcast failed:`, e.message))
-}
-
-async function broadcastScript(script: Script, key: PrivateKey, spend?: SpendUtxo): Promise<string> {
-  if (!validateSpendUtxo(spend)) {
-    return JSON.stringify({ error: 'spend_utxo required: {txid, vout, satoshis, rawTxHex}' })
-  }
-  try {
-    const built = buildChainTx(script, key, spend)
-    await built.tx.sign()
-    const txid = built.tx.id('hex') as string
-    const rawHex = built.tx.toHex()
-    const r = await arcBroadcast(rawHex)
-    if (!r.ok) {
-      return JSON.stringify({ success: false, txid, status: r.status, error: r.body.detail || 'broadcast rejected', body: r.body }, null, 2)
-    }
-    return JSON.stringify({
-      success: true, txid, status: r.status,
-      peck_to: `https://peck.to/tx/${txid}`,
-      new_utxo: { txid, vout: built.changeVout, satoshis: built.change, rawTxHex: rawHex },
-      fee: built.fee,
-    }, null, 2)
-  } catch (e: any) {
-    return JSON.stringify({ error: e.message || String(e) })
-  }
-}
-
-async function broadcastPayment(
-  script: Script,
-  key: PrivateKey,
-  recipientAddr: string,
-  satsAmount: number,
-  spend?: SpendUtxo,
-): Promise<string> {
-  if (satsAmount < 1) return JSON.stringify({ error: `payment amount must be >= 1 sat` })
-  if (!validateSpendUtxo(spend)) return JSON.stringify({ error: 'spend_utxo required' })
-  try {
-    const recipientLock = new P2PKH().lock(recipientAddr)
-    const built = buildChainTx(script, key, spend, [{ lockingScript: recipientLock, satoshis: satsAmount }])
-    await built.tx.sign()
-    const txid = built.tx.id('hex') as string
-    const rawHex = built.tx.toHex()
-    const r = await arcBroadcast(rawHex)
-    if (!r.ok) {
-      return JSON.stringify({ success: false, txid, status: r.status, error: r.body.detail || 'broadcast rejected', body: r.body }, null, 2)
-    }
-    return JSON.stringify({
-      success: true, txid, status: r.status,
-      peck_to: `https://peck.to/tx/${txid}`,
-      new_utxo: { txid, vout: built.changeVout, satoshis: built.change, rawTxHex: rawHex },
-      paid: satsAmount, fee: built.fee,
-    }, null, 2)
-  } catch (e: any) {
-    return JSON.stringify({ error: e.message || String(e) })
-  }
 }
 
 // ============================================================================
