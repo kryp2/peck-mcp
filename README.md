@@ -15,19 +15,13 @@ Case study: [`openrun.peck.to`](https://openrun.peck.to)
 ## Active development
 
 **`master` = stable, public, what `mcp.peck.to` runs.**
-**`async-broadcast-pipeline` = WIP post-hackathon refactor.**
+Two post-hackathon refactor tracks live in their own branches:
 
-The async-broadcast-pipeline branch moves the write path from
-synchronous ARC broadcast to Redis XADD → a dedicated
-[`peck-broadcaster`](https://github.com/kryp2/peck-broadcaster) worker
-that handles ARC, BEEF verification, and broadcast lifecycle outside
-the MCP request path. That gives the MCP sub-50ms `status:"queued"`
-responses under load instead of 400-800ms ARC round-trips.
+- **[`async-broadcast-pipeline`](https://github.com/kryp2/peck-mcp/tree/async-broadcast-pipeline)** — write path moved from synchronous ARC broadcast to Redis XADD → dedicated [`peck-broadcaster`](https://github.com/kryp2/peck-broadcaster) worker handling ARC, BEEF verification, and broadcast lifecycle outside the MCP request path. Sub-50ms `status:"queued"` responses instead of 400-800ms ARC round-trips. See commit `e6ca980`.
 
-See commit `e6ca980` on `async-broadcast-pipeline` for phase 1 (XADD
-via ioredis + `tx.toHexBEEF()` queue payload). Phases 2 (BEEF verify)
-and 3 (lifecycle webhooks back to the caller) are sketched in
-`MEMORY: project_async_broadcast_2026_04_20`.
+- **[`wallet-adapter-refactor`](https://github.com/kryp2/peck-mcp/tree/wallet-adapter-refactor)** — full BRC-100 refactor. Every write-tool routes through [`bitcoin-agent-wallet`](https://www.npmjs.com/package/bitcoin-agent-wallet)'s wallet-toolbox + OS keychain. `signing_key` and `spend_utxo` are removed from all 16 tool schemas — MCP owns the identity end-to-end. Legacy `broadcastScript`/`arcBroadcast`/`buildChainTx`/`SPEND_UTXO_PROP` deleted.
+
+Phases 2 (BEEF verify) and 3 (lifecycle webhooks) of the async-broadcast track are sketched in `MEMORY: project_async_broadcast_2026_04_20`.
 
 Everything below describes master.
 
