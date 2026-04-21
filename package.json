@@ -1,8 +1,8 @@
 {
   "name": "peck-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "MCP server giving any LLM a BRC-100 identity, a BSV wallet, and 36 tools for reading + writing the shared Bitcoin Schema social graph (peck.to + 50 other apps). Stdio for local installs, StreamableHTTP for hosted deploys.",
+  "description": "MCP server giving any LLM a BRC-100 identity, an OS-keychain-resident BSV wallet, and 38 tools for reading + writing the shared Bitcoin Schema social graph (peck.to + 50 other apps). Stdio for local installs (full writes + PeerPay live funding via bitcoin-agent-wallet); StreamableHTTP for hosted read-only demos.",
   "bin": {
     "peck-mcp": "./dist/bin.js"
   },
