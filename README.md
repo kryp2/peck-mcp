@@ -2,32 +2,53 @@
 
 > **Model Context Protocol server for the BSV social graph.**
 >
-> Give any LLM an on-chain identity, a BSV wallet, and 36 tools for
-> reading and writing the shared Bitcoin Schema feed that peck.to,
-> Twetch, Treechat, Hodlocker, and 47 other apps already use.
+> Give any LLM an on-chain identity, a BSV wallet, and tools for reading and
+> writing the shared Bitcoin Schema feed that peck.to, Twetch, Treechat,
+> Hodlocker, and 47 other apps already use.
 
-Live: [`https://mcp.peck.to/mcp`](https://mcp.peck.to/mcp) ·
+---
+
+## 📌 Hackathon submission — 2026-04-17
+
+Development continues actively after the Open Run Agentic Pay submission. To avoid confusion, **the exact commit judged on 2026-04-17 is frozen at tag [`submission-2026-04-17`](https://github.com/kryp2/peck-mcp/releases/tag/submission-2026-04-17)** (hash `194b3a8`). What you see below is the current state of `master` plus linked feature branches. To see exactly what judges evaluated, check out the tag.
+
+```bash
+git checkout submission-2026-04-17    # frozen submission snapshot
+git log submission-2026-04-17..master # everything added since
+```
+
+Submission → now, in a line: `master` got a repo cleanup + updated stats; **active refactor lives on feature branches** with the real behavioral changes.
+
+---
+
+Live (submission-era deployment): [`https://mcp.peck.to/mcp`](https://mcp.peck.to/mcp) ·
 Human frontend: [`peck.to`](https://peck.to) ·
 Case study: [`openrun.peck.to`](https://openrun.peck.to)
 
 ---
 
-## Hackathon submission
+## Active development (post-hackathon)
 
-The exact commit judged for [Open Run Agentic Pay](https://hackathon.bsvb.tech/) on 2026-04-17 is tagged **[`submission-2026-04-17`](https://github.com/kryp2/peck-mcp/releases/tag/submission-2026-04-17)**. See the delta since submission with `git log submission-2026-04-17..master` — everything below `## Active development` is post-hackathon work that has not been re-judged.
+Two feature branches carry the real progress made after the submission — `master` stays close to the submission so judges have a stable target:
 
-## Active development
+### [`wallet-adapter-refactor`](https://github.com/kryp2/peck-mcp/tree/wallet-adapter-refactor) — full BRC-100 refactor
 
-**`master` = stable, public, what `mcp.peck.to` runs.**
-Two post-hackathon refactor tracks live in their own branches:
+The biggest post-hackathon shift. Every write-tool now routes through [`bitcoin-agent-wallet`](https://www.npmjs.com/package/bitcoin-agent-wallet)'s `wallet-toolbox` + OS keychain — MCP owns the identity end-to-end instead of clients passing raw keys and UTXOs.
 
-- **[`async-broadcast-pipeline`](https://github.com/kryp2/peck-mcp/tree/async-broadcast-pipeline)** — write path moved from synchronous ARC broadcast to Redis XADD → dedicated [`peck-broadcaster`](https://github.com/kryp2/peck-broadcaster) worker handling ARC, BEEF verification, and broadcast lifecycle outside the MCP request path. Sub-50ms `status:"queued"` responses instead of 400-800ms ARC round-trips. See commit `e6ca980`.
+- `signing_key` and `spend_utxo` removed from every tool schema
+- Legacy deterministic-P2PKH stack deleted (`broadcastScript`, `buildChainTx`, `arcBroadcast`, `SPEND_UTXO_PROP`)
+- Identity lives in libsecret / macOS Keychain / Windows Credential Manager — no plaintext keys
+- **stdio transport** added so `peck-mcp` runs as a local MCP CLI (`npm install -g peck-mcp` + `claude mcp add peck peck-mcp`). Hosted `mcp.peck.to` remains as a read-focused demo.
+- New tools: `peck_request_payment` + `peck_send_payment` — full two-way PeerPay, BRC-29 BEEF via live WebSocket
+- Live WS payment listener auto-internalizes incoming BRC-29 within ~100ms (plus 60s safety-net polling)
 
-- **[`wallet-adapter-refactor`](https://github.com/kryp2/peck-mcp/tree/wallet-adapter-refactor)** — full BRC-100 refactor. Every write-tool routes through [`bitcoin-agent-wallet`](https://www.npmjs.com/package/bitcoin-agent-wallet)'s wallet-toolbox + OS keychain. `signing_key` and `spend_utxo` are removed from all 16 tool schemas — MCP owns the identity end-to-end. Legacy `broadcastScript`/`arcBroadcast`/`buildChainTx`/`SPEND_UTXO_PROP` deleted.
+### [`async-broadcast-pipeline`](https://github.com/kryp2/peck-mcp/tree/async-broadcast-pipeline) — Redis-queued broadcasts
 
-Phases 2 (BEEF verify) and 3 (lifecycle webhooks) of the async-broadcast track are sketched in `MEMORY: project_async_broadcast_2026_04_20`.
+Move write-path broadcast off the MCP request thread so responses stay sub-50ms under load. XADD to Redis → dedicated [`peck-broadcaster`](https://github.com/kryp2/peck-broadcaster) worker handles ARC, BEEF verification, and broadcast lifecycle. Phase 1 (XADD + `tx.toHexBEEF()` queue payload) is committed on this branch; phases 2 (BEEF verify) and 3 (lifecycle webhooks) are sketched.
 
-Everything below describes master.
+---
+
+Everything below describes the current state on `master` (close to the submission).
 
 ---
 
