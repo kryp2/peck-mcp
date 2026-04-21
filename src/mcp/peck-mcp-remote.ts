@@ -22,7 +22,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js'
 import { randomUUID, randomBytes } from 'crypto'
-import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
+import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet, AuthFetch } from '@bsv/sdk'
 import { createHash } from 'crypto'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -624,6 +624,33 @@ const TOOLS = [
         },
       },
       required: ['handle', 'display_name', 'identity_key'],
+    },
+  },
+  {
+    name: 'peck_set_identity',
+    description:
+      'One-shot identity setup: publishes on-chain Bitcoin Schema profile (MAP ' +
+      'type=profile), registers the handle in identity.peck.to, AND acquires a ' +
+      'signed BRC-52 certificate from identity.peck.to (type=peck.to/identity/v1) ' +
+      'via BRC-104 mutual-auth. Certificate is stored in the agent wallet; future ' +
+      'verifiers can prove fields via proveCertificate.\n\n' +
+      'Coordinates the three identity layers:\n' +
+      '  1) On-chain profile-tx — canonical, self-signed by the agent key\n' +
+      '  2) identity.peck.to registry — handle → identityKey cache\n' +
+      '  3) BRC-52 cert — issuer vouches; wallet can prove on demand\n\n' +
+      'Multiple issuers can issue certificates over the same handle; the verifier ' +
+      'chooses who they trust. This tool calls identity.peck.to as the issuer.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        handle: { type: 'string', description: 'Lowercase a-z 0-9 . _ - (1-100 chars). Used as paymail local-part and display handle.' },
+        display_name: { type: 'string', description: 'Shown in feeds and profiles.' },
+        bio: { type: 'string', description: 'Optional short bio for profile.' },
+        avatar: { type: 'string', description: 'Optional avatar URL (UHRP or HTTPS).' },
+        entity_type: { type: 'string', description: '"agent" | "human" | "service". Default: agent.' },
+        agent_account: { type: 'string', description: 'Which fleet agent to set identity for. Default: "default".' },
+      },
+      required: ['handle', 'display_name'],
     },
   },
 
@@ -1691,6 +1718,111 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         } catch (e: any) {
           text = JSON.stringify({ error: `identity.peck.to unreachable: ${e.message}` })
         }
+        break
+      }
+
+      // ─── SET IDENTITY — coordinated profile-tx + registry + BRC-52 cert ───
+      case 'peck_set_identity': {
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn first.` })
+          break
+        }
+        const handle = String(args?.handle || '').toLowerCase().trim()
+        const displayName = String(args?.display_name || '').trim()
+        const bio = args?.bio ? String(args.bio) : undefined
+        const avatar = args?.avatar ? String(args.avatar) : undefined
+        const entityType = String(args?.entity_type || 'agent').toLowerCase()
+        if (!/^[a-z0-9._-]{1,100}$/.test(handle)) {
+          text = JSON.stringify({ error: 'invalid handle (1-100 chars, lowercase a-z 0-9 . _ -)' })
+          break
+        }
+        if (!displayName) {
+          text = JSON.stringify({ error: 'display_name required' })
+          break
+        }
+        const paymail = `${handle}@peck.to`
+        const identityKey = agent.wallet.getIdentityKey()
+        const result: Record<string, any> = {
+          success: true,
+          handle,
+          display_name: displayName,
+          paymail,
+          identity_key: identityKey,
+          agent_account: account,
+          layers: {},
+        }
+
+        // LAYER 1 — on-chain profile-tx (Bitcoin Schema MAP type=profile)
+        try {
+          const fields: Record<string, string> = { display_name: displayName, paymail }
+          if (bio) fields.bio = bio
+          if (avatar) fields.avatar = avatar
+          const script = buildMapOnly('profile', fields, agent.key, APP_NAME)
+          const r = await agent.wallet.broadcast({
+            description: 'peck profile', outputs: [{ lockingScript: script.toHex(), satoshis: 0 }], labels: ['peck', 'profile'],
+          })
+          result.layers.profile_tx = {
+            status: r.status, txid: r.txid, peck_to: `https://peck.to/tx/${r.txid}`,
+          }
+        } catch (e: any) {
+          result.layers.profile_tx = { error: e.message }
+        }
+
+        // LAYER 2 — identity.peck.to registry entry (unauthenticated /v1/register)
+        try {
+          const resp = await fetch(`${IDENTITY_URL}/v1/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ identityKey, handle, displayName, type: entityType }),
+          })
+          const body = await resp.text()
+          if (!resp.ok) {
+            result.layers.registry = { error: `${resp.status} ${body.slice(0, 200)}` }
+          } else {
+            result.layers.registry = { status: 'registered', response: JSON.parse(body || '{}') }
+          }
+        } catch (e: any) {
+          result.layers.registry = { error: `unreachable: ${e.message}` }
+        }
+
+        // LAYER 3 — BRC-52 certificate via BRC-104 mutual-auth POST /v1/issue-cert
+        try {
+          const authFetch = new AuthFetch(agent.wallet.getWalletClient())
+          const resp = await authFetch.fetch(`${IDENTITY_URL}/v1/issue-cert`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ handle, displayName, type: entityType, paymail }),
+          })
+          if (!resp.ok) {
+            const body = await resp.text()
+            result.layers.certificate = { error: `${resp.status} ${body.slice(0, 200)}` }
+          } else {
+            const { certificate, keyringForSubject } = await resp.json() as any
+            await agent.wallet.acquireCertificate({
+              type: certificate.type,
+              certifier: certificate.certifier,
+              serialNumber: certificate.serialNumber,
+              revocationOutpoint: certificate.revocationOutpoint,
+              signature: certificate.signature,
+              fields: certificate.fields,
+              keyringForSubject,
+            })
+            result.layers.certificate = {
+              status: 'acquired',
+              type: certificate.type,
+              serial_number: certificate.serialNumber,
+              certifier: certificate.certifier,
+              revocation_outpoint: certificate.revocationOutpoint,
+            }
+          }
+        } catch (e: any) {
+          result.layers.certificate = { error: `issue-cert failed: ${e.message}` }
+        }
+
+        result.next = 'Verifier apps can now check your identity via proveCertificate. Hover UIs can look up registry for display resolution.'
+        text = JSON.stringify(result, null, 2)
         break
       }
 
