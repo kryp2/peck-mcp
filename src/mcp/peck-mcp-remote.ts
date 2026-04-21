@@ -1802,10 +1802,35 @@ const httpServer = createServer(async (req, res) => {
   res.writeHead(404); res.end('not found')
 })
 
-httpServer.listen(PORT, () => {
-  console.log(`[peck-mcp] v3.0.0 — read + build, no signing`)
-  console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
-  console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
-  console.log(`[peck-mcp] network: ${NETWORK}`)
-  console.log(`[peck-mcp] ${TOOLS.length} tools (${TOOLS.filter(t => t.name.startsWith('peck_build')).length} write helpers, ${TOOLS.filter(t => !t.name.startsWith('peck_build') && t.name !== 'peck_identity_info').length} read)`)
-})
+// ============================================================================
+// Transport selection
+// ============================================================================
+//
+// This file supports two transports:
+//   - HTTP (StreamableHTTP) — default, what `mcp.peck.to` runs via Cloud Run
+//   - stdio — used when installed locally (`peck-mcp` CLI or
+//     `npx peck-mcp`). Triggered by MCP_TRANSPORT=stdio env or --stdio argv.
+//
+// Stdio is the recommended path for any client that needs writes: the agent
+// identity stays in your OS keychain, never on a shared server.
+
+const USE_STDIO = process.env.MCP_TRANSPORT === 'stdio' || process.argv.includes('--stdio')
+
+if (USE_STDIO) {
+  const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js')
+  const srv = createSessionServer()
+  const transport = new StdioServerTransport()
+  await srv.connect(transport)
+  // Writes to stderr since stdout is reserved for MCP JSON-RPC frames.
+  console.error(`[peck-mcp] stdio transport ready (${TOOLS.length} tools)`)
+  console.error(`[peck-mcp] overlay: ${OVERLAY_URL}`)
+  console.error(`[peck-mcp] network: ${NETWORK}`)
+} else {
+  httpServer.listen(PORT, () => {
+    console.log(`[peck-mcp] v3.0.0 — read + build, no signing`)
+    console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
+    console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
+    console.log(`[peck-mcp] network: ${NETWORK}`)
+    console.log(`[peck-mcp] ${TOOLS.length} tools`)
+  })
+}
