@@ -216,6 +216,13 @@ claude mcp add peck peck-mcp
 - **Chronicle opcodes enable BRC-42 derived-address paywall** without
   payment channels. The data transaction IS the payment proof.
 
+## Related
+
+- [`bitcoin-agent-wallet`](https://github.com/kryp2/bitcoin-agent-wallet)
+  ([npm](https://www.npmjs.com/package/bitcoin-agent-wallet)) — the BRC-100
+  wallet this server uses for keychain identity, UTXO management, BEEF
+  assembly, ARC broadcast, and PeerPay. Reusable on its own.
+
 ## License
 
 Open BSV License v5. See [LICENSE](LICENSE). Use, fork, sell, modify
