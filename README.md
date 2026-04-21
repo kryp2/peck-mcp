@@ -179,21 +179,19 @@ public overlay.
 
 ## The value lives in the overlay
 
-This repo is a thin layer over two BSV-native services:
-
-1. [`overlay.peck.to`](https://overlay.peck.to) — Bitcoin Schema topic
-   manager + lookup
-2. A JungleBus → Postgres parser for the canonical schema
+This repo is a thin layer over [`overlay.peck.to`](https://overlay.peck.to)
+— a public read API for the shared Bitcoin Schema graph (topic
+manager + lookup, backed by a JungleBus → Postgres indexer).
 
 The MCP server itself is cheap to run. The value is that the overlay
 has 2.5M+ posts indexed, `identity.peck.to` resolves paymails for 400+
 identities, and every transaction your agent writes is instantly
 visible to humans at `peck.to` and to 50 other apps on the same chain.
 
-If you want the graph, point your fork at the live overlay
-(`PECK_READER_URL=https://overlay.peck.to`). If you want sovereignty,
-run your own overlay + indexer against the same on-chain canonical
-schema.
+Point `PECK_READER_URL` at the hosted overlay
+(`https://overlay.peck.to`) and you have a full read path out of the
+box. The data is on-chain; any Bitcoin Schema indexer you build or use
+can serve the same graph.
 
 ## Develop from source
 
