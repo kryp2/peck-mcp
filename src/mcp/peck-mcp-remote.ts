@@ -1,15 +1,15 @@
 /**
- * Peck MCP Remote — pure read + script builder. No wallet. No signing.
+ * Peck MCP Remote — read + write BRC-100 social graph.
  *
- * The agent owns the key. MCP just helps:
- *   - Read the social graph (feed, thread, search, functions)
- *   - Build unsigned Bitcoin Schema scripts
- *   - The agent signs and broadcasts locally
+ * MCP owns its own BRC-100 identity (loaded from OS keychain via
+ * bitcoin-agent-wallet). Every write routes through @bsv/wallet-toolbox's
+ * createAction — UTXO selection, ancestor BEEF assembly, signing, and ARC
+ * submission all happen inside the wallet. Callers do NOT pass keys or
+ * UTXOs. MAP `app` field distinguishes which CLI posted.
  *
- * Agent wallet lives at ~/.peck/identity.json (shared across all CLI tools).
- * MAP `app` field distinguishes which CLI posted.
- *
- * URL: https://mcp.peck.to/mcp
+ * Hosted endpoint (https://mcp.peck.to/mcp) runs without a keychain and
+ * therefore answers "wallet unavailable" to write-tools — local install
+ * required for writes.
  */
 import 'dotenv/config'
 import { createServer, IncomingMessage, ServerResponse } from 'http'
@@ -22,8 +22,11 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js'
 import { randomUUID, randomBytes } from 'crypto'
-import { PrivateKey, PublicKey, Transaction, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
+import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
 import { createHash } from 'crypto'
+import { homedir } from 'os'
+import { join } from 'path'
+import { BitcoinAgentWallet, getOrMigrateIdentityKey } from 'bitcoin-agent-wallet'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -33,6 +36,71 @@ const ARC_URL = NETWORK === 'main' ? 'https://arc.taal.com' : 'https://arc-test.
 const ARC_KEY = process.env.TAAL_API_KEY || ''
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
 const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
+
+// ============================================================================
+// Agent wallet bootstrap — MCP owns its own BRC-100 identity via peck-agent-
+// wallet, loaded from OS keychain (auto-migrated from legacy ~/.peck/identity.json
+// on first run). Every write-tool routes through agentWallet.broadcast() so
+// UTXO-state, ancestor BEEF, signing, and ARC submission are wallet-toolbox's
+// responsibility — MCP never polls UTXOs or hand-rolls P2PKH.
+// ============================================================================
+
+let agentWallet: BitcoinAgentWallet | null = null
+let agentKey: PrivateKey | null = null   // used by Bitcoin Schema script builders (AIP signing)
+
+async function initAgentWallet(): Promise<void> {
+  try {
+    const privateKeyHex = await getOrMigrateIdentityKey()
+    agentKey = PrivateKey.fromHex(privateKeyHex)
+    agentWallet = new BitcoinAgentWallet({
+      privateKeyHex,
+      network: NETWORK as 'main' | 'test',
+      appName: APP_NAME,
+      storage: {
+        kind: 'sqlite',
+        filePath: process.env.PECK_MCP_WALLET_DB || join(homedir(), '.peck-mcp-wallet.db'),
+      },
+    })
+    await agentWallet.init()
+    console.error(`[peck-mcp] wallet ready — identityKey=${agentWallet.getIdentityKey().slice(0, 16)}…`)
+
+    // Startup catch-up — pull anything already waiting in payment_inbox
+    try {
+      const processed = await agentWallet.processIncomingPayments()
+      if (processed > 0) console.error(`[peck-mcp] startup poll — accepted ${processed} pending payment(s)`)
+    } catch (e: any) {
+      console.error(`[peck-mcp] startup payment poll failed: ${e?.message || e}`)
+    }
+
+    // Live WS listener — incoming BRC-29 payments auto-internalize as they arrive.
+    // Messagebox WS pushes each payment token; PeerPayClient's default handler
+    // runs wallet.internalizeAction automatically, no polling gap.
+    agentWallet.listenForLivePayments().then(() => {
+      console.error(`[peck-mcp] live payment listener connected — payments auto-accept on arrival`)
+    }).catch((e: any) => {
+      console.error(`[peck-mcp] live payment listener failed: ${e?.message || e} — falling back to polling only`)
+    })
+
+    // Safety net — if the WS drops silently, poll every 60s so payments still land
+    // within a minute. Harmless when the listener is healthy (nothing to process).
+    setInterval(async () => {
+      try {
+        if (!agentWallet) return
+        const n = await agentWallet.processIncomingPayments()
+        if (n > 0) console.error(`[peck-mcp] safety-poll — accepted ${n} payment(s) the WS missed`)
+      } catch (e: any) {
+        console.error(`[peck-mcp] safety-poll error: ${e?.message || e}`)
+      }
+    }, 60_000).unref()
+  } catch (e: any) {
+    console.error(`[peck-mcp] wallet init failed: ${e?.message || e}`)
+    console.error(`[peck-mcp] write-tools will return "wallet unavailable" until this is resolved.`)
+    agentWallet = null
+    agentKey = null
+  }
+}
+
+await initAgentWallet()
 
 // Bitcoin Schema protocol prefixes
 const PROTO_B = '19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut'
@@ -63,21 +131,6 @@ const mcpServer = new Server(
   { name: 'peck-mcp', version: '3.1.0' },
   { capabilities: { tools: {} } },
 )
-
-// Shared schema for deterministic P2PKH spend — used by all write-tools.
-// Client must supply a UTXO owned by their identity address; server never
-// auto-fetches (no wallet-toolbox, no WoC loop). Mirrors peck_tag_tx shape.
-const SPEND_UTXO_PROP = {
-  type: 'object' as const,
-  description: 'Current UTXO owned by the agent\'s P2PKH identity address. Pass {txid, vout, satoshis, rawTxHex} from a prior tx or peck_balance-derived lookup. Required — server will not auto-fetch.',
-  properties: {
-    txid: { type: 'string' },
-    vout: { type: 'number' },
-    satoshis: { type: 'number' },
-    rawTxHex: { type: 'string', description: 'Full raw hex of the source transaction.' },
-  },
-  required: ['txid', 'vout', 'satoshis', 'rawTxHex'],
-}
 
 const TOOLS = [
   // ─── READ tools (no auth needed) ───
@@ -291,70 +344,62 @@ const TOOLS = [
     name: 'peck_unlike_tx',
     description:
       'Undo a previous like. Builds a MAP unlike tx pointing to the target post. ' +
-      'Parser removes the like from the reactions table. Use when an agent changes ' +
-      'its mind or reacts to content moderation.',
+      'Parser removes the like from the reactions table. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post to unlike.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key', 'spend_utxo'],
+      required: ['target_txid'],
     },
   },
   {
     name: 'peck_unfollow_tx',
     description:
       'Stop following a previously followed paymail/handle. Builds a MAP unfollow tx. ' +
-      'Pass the same identifier you used when following — the indexer matches on the paymail field.',
+      'Pass the same identifier you used when following — the indexer matches on the paymail field. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_paymail: { type: 'string', description: 'The paymail/handle to unfollow (must match the follow target).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_paymail', 'signing_key', 'spend_utxo'],
+      required: ['target_paymail'],
     },
   },
   {
     name: 'peck_friend_tx',
     description:
       'Friend another identity on the BSV social graph. Builds a MAP type=friend tx ' +
-      'targeting the recipient bapID with an optional pubkey hint. Friends are a stronger ' +
-      'social signal than follows — they are typically used as the gate for richer features ' +
-      'like encrypted DMs or shared private channels. Bitcoin Schema friends are one-sided; ' +
-      'mutual friendship requires both parties to issue their own friend tx.',
+      'targeting the recipient bapID with an optional pubkey hint. Bitcoin Schema friends ' +
+      'are one-sided; mutual friendship requires both parties to issue their own friend tx. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_bap_id: { type: 'string', description: 'BSV address (or BAP id) of the identity to friend.' },
         target_pubkey: { type: 'string', description: 'Optional compressed pubkey hex of the target — improves discoverability for encryption flows.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
+      required: ['target_bap_id'],
     },
   },
   {
     name: 'peck_unfriend_tx',
     description:
       'Undo a previous friend tx. Builds a MAP type=unfriend tx; the indexer parser ' +
-      'removes the (friender, bap_id) row. Note: requires the JungleBus UNFRIEND ' +
-      'subscription to be live for the row to actually clear — see peck-indexer-go main.go.',
+      'removes the (friender, bap_id) row. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_bap_id: { type: 'string', description: 'The bapID you previously friended.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
+      required: ['target_bap_id'],
     },
   },
   {
@@ -362,17 +407,15 @@ const TOOLS = [
     description:
       'Repost another post with an optional comment (quote-tweet style). ' +
       'Builds a Bitcoin Schema tx with type=repost and a ref to the original. ' +
-      'Agents can amplify useful content for their followers.',
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post to repost.' },
         content: { type: 'string', description: 'Your comment/quote (at least a short one is required for the tx to save).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'content', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'content'],
     },
   },
   {
@@ -387,10 +430,8 @@ const TOOLS = [
       "(BRC-2 encryption via @bsv/sdk's ProtoWallet, byte-compatible with peck-desktop's " +
       'wallet.encrypt — so a human reading via their BRC-100 wallet decrypts it cleanly). ' +
       "MCP resolves the recipient's identity pubkey via /v1/user/:address unless you pass " +
-      'recipient_pubkey. The envelope has a "PECK1:" magic prefix and embeds the sender ' +
-      "pubkey + keyID so readers don't need an out-of-band lookup. peck_messages auto-decrypts " +
-      'when given your signing_key.\n\n' +
-      'Pass encrypt=false to send a plaintext DM (debug / testing only — not recommended).',
+      'recipient_pubkey. Pass encrypt=false to send a plaintext DM (debug only). ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -398,21 +439,19 @@ const TOOLS = [
         channel: { type: 'string', description: 'Channel name. Mutually exclusive with recipient.' },
         recipient: { type: 'string', description: 'Recipient BSV address for a DM. Mutually exclusive with channel.' },
         recipient_pubkey: { type: 'string', description: 'Recipient identity pubkey (compressed hex). Optional — defaults to looking up via /v1/user/:address.' },
-        encrypt: { type: 'boolean', description: 'Encrypt the DM with BRC-78. Defaults to true for DMs, ignored for channel/global.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
+        encrypt: { type: 'boolean', description: 'Encrypt the DM with BRC-2. Defaults to true for DMs, ignored for channel/global.' },
         agent_app: { type: 'string' },
       },
-      required: ['content', 'signing_key', 'spend_utxo'],
+      required: ['content'],
     },
   },
   {
     name: 'peck_profile_tx',
     description:
-      'Build + sign + broadcast a MAP profile transaction that sets your display_name, avatar, ' +
-      'bio, and/or paymail on the BSV social graph. This is how agents declare their own identity. ' +
-      'All fields are optional but at least one must be provided. Only your most recent profile ' +
-      'tx is shown as your canonical profile.',
+      'Build + broadcast a MAP profile transaction that sets your display_name, avatar, ' +
+      'bio, and/or paymail on the BSV social graph. All fields are optional but at least one ' +
+      'must be provided. Only your most recent profile tx is shown as your canonical profile. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -420,11 +459,8 @@ const TOOLS = [
         avatar: { type: 'string', description: 'URL to an avatar image (e.g. a UHRP or HTTPS URL).' },
         bio: { type: 'string', description: 'Short bio / description.' },
         paymail: { type: 'string', description: 'Your paymail address (optional).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['signing_key', 'spend_utxo'],
     },
   },
   {
@@ -450,19 +486,17 @@ const TOOLS = [
       'Tip / pay another user on-chain. Builds a Bitcoin Schema MAP type=payment ' +
       'tx that references a target post (target_txid) and moves the requested sat amount ' +
       'to the recipient. The recipient is resolved via /v1/post/:target_txid → author ' +
-      'unless you pass recipient_address explicitly. Use this when you want a post ' +
-      'author to actually receive value, not just a like.',
+      'unless you pass recipient_address explicitly. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post being tipped.' },
         amount_sats: { type: 'number', description: 'Payment amount in satoshis (>= 1).' },
         recipient_address: { type: 'string', description: 'Optional — defaults to the post author resolved via /v1/post/:target_txid.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'amount_sats', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'amount_sats'],
     },
   },
   {
@@ -546,68 +580,63 @@ const TOOLS = [
     },
   },
 
-  // ─── WRITE tools (agent provides signing_key, MCP builds+signs+broadcasts) ───
-  // The agent reads signing_key from ~/.peck/identity.json locally.
-  // Key is sent over HTTPS (encrypted in transit), never stored by MCP.
+  // ─── WRITE tools ───
+  // MCP owns its own BRC-100 identity (loaded from OS keychain via bitcoin-agent-wallet).
+  // Every write goes through wallet-toolbox's createAction — UTXO selection, ancestor
+  // BEEF assembly, signing, and ARC submission all happen inside the wallet. Callers
+  // do NOT supply keys or UTXOs; install peck-mcp locally if you need writes.
   {
     name: 'peck_post_tx',
     description:
-      'Post to the BSV social graph. Builds a Bitcoin Schema tx (MAP+B+AIP), ' +
-      'signs it with your key, broadcasts to ARC, and returns the txid. ' +
-      'Your post appears in peck.to within seconds. ' +
-      'Read your signing_key from ~/.peck/identity.json (privateKeyHex field).',
+      'Post to the BSV social graph. Builds a Bitcoin Schema tx (MAP+B+AIP) and ' +
+      'broadcasts it. Your post appears in peck.to within seconds. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: { type: 'string', description: 'Post content (markdown).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for discovery.' },
         channel: { type: 'string', description: 'Optional channel.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['content', 'signing_key', 'spend_utxo'],
+      required: ['content'],
     },
   },
   {
     name: 'peck_reply_tx',
     description:
-      'Reply to a post on the BSV social graph. Builds, signs, broadcasts.',
+      'Reply to a post on the BSV social graph. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: { type: 'string', description: 'Reply content.' },
         parent_txid: { type: 'string', description: 'Txid of post to reply to.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['content', 'parent_txid', 'signing_key', 'spend_utxo'],
+      required: ['content', 'parent_txid'],
     },
   },
   {
     name: 'peck_like_tx',
-    description: 'Like a post. Builds, signs, broadcasts. Likes count toward reputation.',
+    description:
+      'Like a post. Likes count toward reputation. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of post to like.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key', 'spend_utxo'],
+      required: ['target_txid'],
     },
   },
   {
     name: 'peck_tag_tx',
     description:
-      'Deterministic retroactive-tag transaction for BSV Bitcoin Schema. ' +
-      'Builds MAP SET | type=tag | context=tx | tx=<target> | tags=csv [category] [lang] [tone], ' +
-      'signs with AIP, spends the agent\'s P2PKH UTXO directly (NO wallet-toolbox, NO Monitor, ' +
-      'NO optimistic retry), broadcasts to ARC GorillaPool, and returns the new change UTXO ' +
-      'ONLY if ARC confirms the transaction is on the network. Truthful — if the broadcast ' +
-      'fails, no new_utxo is returned and the caller MUST NOT update its local wallet state.',
+      'Retroactive-tag transaction for BSV Bitcoin Schema. ' +
+      'Builds MAP SET | type=tag | context=tx | tx=<target> | tags=csv [category] [lang] [tone]. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -616,35 +645,23 @@ const TOOLS = [
         category: { type: 'string' },
         lang: { type: 'string' },
         tone: { type: 'string' },
-        signing_key: { type: 'string', description: 'Agent privateKeyHex. Signs AIP + P2PKH unlock.' },
-        spend_utxo: {
-          type: 'object',
-          description: 'Current UTXO owned by the agent\'s P2PKH identity address.',
-          properties: {
-            txid: { type: 'string' },
-            vout: { type: 'number' },
-            satoshis: { type: 'number' },
-            rawTxHex: { type: 'string', description: 'Full raw hex of the source transaction.' },
-          },
-          required: ['txid', 'vout', 'satoshis', 'rawTxHex'],
-        },
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'tags', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'tags'],
     },
   },
   {
     name: 'peck_follow_tx',
-    description: 'Follow someone on the BSV social graph. Builds, signs, broadcasts.',
+    description:
+      'Follow someone on the BSV social graph. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_pubkey: { type: 'string', description: 'Pubkey of who to follow.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_pubkey', 'signing_key', 'spend_utxo'],
+      required: ['target_pubkey'],
     },
   },
 
@@ -654,7 +671,8 @@ const TOOLS = [
     description:
       'Register a callable function on the BSV social graph. This IS your marketplace listing. ' +
       'Other agents find it via peck_functions, call it via peck_function_call. ' +
-      'The registration is a Bitcoin Schema post with type=function.',
+      'The registration is a Bitcoin Schema post with type=function. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -662,11 +680,47 @@ const TOOLS = [
         description: { type: 'string', description: 'What the function does.' },
         args_schema: { type: 'string', description: 'JSON schema for args. E.g. {"prompt":"string"}' },
         price: { type: 'number', description: 'Price in satoshis per call.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'description', 'price', 'signing_key', 'spend_utxo'],
+      required: ['name', 'description', 'price'],
+    },
+  },
+  {
+    name: 'peck_request_payment',
+    description:
+      'Ask a recipient for a BRC-29 payment via the standard PeerPay payment_requests messagebox. ' +
+      'Their BRC-100 wallet (BSV Desktop, Babbage, bsv-browser) shows it as an incoming request; ' +
+      'when they approve, sendLivePayment routes BRC-29 BEEF back to our payment_inbox and the ' +
+      'live listener auto-internalizes it. Returns {requestId, requestProof}. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        recipient_identity_key: { type: 'string', description: '66-hex compressed pubkey of the payer.' },
+        sats: { type: 'number', description: 'Requested amount in satoshis.' },
+        description: { type: 'string', description: 'Human-readable reason shown in recipient wallet.' },
+        expires_at_ms: { type: 'number', description: 'Unix ms when the request expires. Default: now + 1h.' },
+      },
+      required: ['recipient_identity_key', 'sats', 'description'],
+    },
+  },
+  {
+    name: 'peck_send_payment',
+    description:
+      'Push a BRC-29 payment to a recipient over PeerPay live WS — the inverse of peck_request_payment. ' +
+      'Uses wallet-toolbox createAction internally (deducts from our spendable balance), wraps the signed ' +
+      'BEEF in a PeerPay PaymentToken with derivation metadata, and delivers it to the recipient\'s ' +
+      'payment_inbox. If their listenForLivePayments is active, their wallet auto-internalizes within ~100ms. ' +
+      'Use for agent-initiated payments: refunds after failed tasks, tips, agent-to-agent settlements. ' +
+      "Requires sufficient spendable balance for amount + network fee. Broadcast signed by MCP's " +
+      'keychain-resident agent identity.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        recipient_identity_key: { type: 'string', description: '66-hex compressed pubkey of the payee.' },
+        sats: { type: 'number', description: 'Amount to send in satoshis (>= 1).' },
+      },
+      required: ['recipient_identity_key', 'sats'],
     },
   },
   {
@@ -674,18 +728,16 @@ const TOOLS = [
     description:
       'Call a registered function. Posts the call on-chain with args + provider bapID. ' +
       'The provider sees it in their feed and responds as a reply. ' +
-      'Check the thread of your call tx to find the response.',
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'Function name to call.' },
         args: { type: 'string', description: 'JSON args string.' },
         provider_address: { type: 'string', description: 'AIP address of the function provider.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'provider_address', 'signing_key', 'spend_utxo'],
+      required: ['name', 'provider_address'],
     },
   },
   {
@@ -738,7 +790,7 @@ function buildPost(content: string, opts: {
   // AIP
   // BSM and createHash imported at top level
   const addr = opts.signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), opts.signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), opts.signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -770,7 +822,7 @@ function buildRepost(content: string, targetTxid: string, signingKey: PrivateKey
     pushData(s, 'tx'); pushData(s, targetTxid)
   }
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content || targetTxid).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content || targetTxid).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -902,7 +954,7 @@ function buildMessage(
     pushData(s, 'bapID'); pushData(s, opts.recipient)
   }
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -918,167 +970,9 @@ function buildMapOnly(type: string, fields: Record<string, string>, signingKey: 
   // AIP
   // BSM and createHash imported at top level
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
-}
-
-// ============================================================================
-// Deterministic P2PKH broadcast primitive.
-//
-// Every write-tool in MCP routes through this. No wallet-toolbox, no Monitor,
-// no optimistic retry. Client passes spend_utxo {txid,vout,satoshis,rawTxHex}.
-// We build the tx, sign with agent key, broadcast DIRECTLY to ARC GorillaPool,
-// and return success + new_utxo ONLY if ARC confirms SEEN_ON_NETWORK.
-//
-// Truthful: the txid we return IS the txid on chain. No mutation, no lies.
-// Client is responsible for persisting new_utxo and driving the chain.
-// ============================================================================
-
-interface SpendUtxo {
-  txid: string
-  vout: number
-  satoshis: number
-  rawTxHex: string
-}
-
-// Legacy GorillaPool ARC — proven mainnet path. Arcade (Teranode-backed)
-// rejected our TXs with 467 + 404 on known-mined mainnet TXs; appears to
-// not share mempool/index with mainnet. ARC_WRITE_URL env overrides.
-const ARC_WRITE_URL = process.env.ARC_WRITE_URL
-  || (NETWORK === 'main' ? 'https://arc.gorillapool.io/v1/tx' : 'https://arc-test.taal.com/v1/tx')
-
-function validateSpendUtxo(u: any): u is SpendUtxo {
-  return !!u && typeof u.txid === 'string' && typeof u.vout === 'number'
-    && typeof u.satoshis === 'number' && typeof u.rawTxHex === 'string'
-}
-
-// ============================================================================
-// Broadcast helpers — P2PKH deterministic, direct ARC
-// ============================================================================
-
-function buildChainTx(
-  script: Script,
-  key: PrivateKey,
-  spend: SpendUtxo,
-  extraOutputs: Array<{ lockingScript: Script; satoshis: number }> = [],
-): { tx: Transaction; rawHex: string; txid: string; fee: number; change: number; changeVout: number } {
-  const addr = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const parent = Transaction.fromHex(spend.rawTxHex)
-
-  const tx = new Transaction()
-  tx.addInput({
-    sourceTransaction: parent,
-    sourceOutputIndex: spend.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(key),
-  })
-  tx.addOutput({ lockingScript: script, satoshis: 0 })
-  let extraSats = 0
-  for (const o of extraOutputs) {
-    tx.addOutput({ lockingScript: o.lockingScript, satoshis: o.satoshis })
-    extraSats += o.satoshis
-  }
-
-  const lockHex = script.toHex()
-  const extraSize = extraOutputs.reduce((s, o) => s + o.lockingScript.toHex().length / 2 + 10, 0)
-  const estSize = 10 + 148 + 10 + lockHex.length / 2 + extraSize + 34
-  const fee = Math.max(20, Math.ceil(estSize * 100 / 1000)) + 1
-  const change = spend.satoshis - extraSats - fee
-  if (change < 1) throw new Error(`insufficient funds: ${spend.satoshis} − ${extraSats} − ${fee} fee = ${change}`)
-  tx.addOutput({ lockingScript: new P2PKH().lock(addr), satoshis: change })
-  const changeVout = 1 + extraOutputs.length
-  return { tx, rawHex: '', txid: '', fee, change, changeVout }
-}
-
-// ARC success-state progression: QUEUED → RECEIVED → STORED → ANNOUNCED_TO_NETWORK
-// → REQUESTED_BY_NETWORK → SENT_TO_NETWORK → ACCEPTED_BY_NETWORK → SEEN_ON_NETWORK → MINED.
-// Anything in that progression means the tx was accepted — treat as ok.
-const ARC_OK_STATES = new Set([
-  'ANNOUNCED_TO_NETWORK',
-  'REQUESTED_BY_NETWORK',
-  'SENT_TO_NETWORK',
-  'ACCEPTED_BY_NETWORK',
-  'SEEN_ON_NETWORK',
-  'MINED',
-  'CONFIRMED',
-])
-
-async function arcBroadcast(rawHex: string): Promise<{ ok: boolean; txid: string; status: string; body: any }> {
-  const isGorilla = ARC_WRITE_URL.includes('gorillapool')
-  const taalKey = process.env.MAIN_TAAL_API_KEY || process.env.TAAL_MAINNET_KEY || ''
-  const r = await fetch(ARC_WRITE_URL, {
-    method: 'POST',
-    headers: isGorilla
-      ? { 'Content-Type': 'application/octet-stream' }
-      : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${taalKey}` },
-    body: isGorilla ? Buffer.from(rawHex, 'hex') : JSON.stringify({ rawTx: rawHex }),
-  })
-  const body = await r.json().catch(() => ({})) as any
-  const status = body.txStatus || body.status || `http-${r.status}`
-  const ok = r.ok && ARC_OK_STATES.has(status)
-  return { ok, txid: body.txid || '', status, body }
-}
-
-function arcBroadcastAsync(rawHex: string, txid: string): void {
-  fetch(ARC_WRITE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: Buffer.from(rawHex, 'hex'),
-  }).catch(e => console.error(`[arc-async] ${txid.slice(0, 12)} broadcast failed:`, e.message))
-}
-
-async function broadcastScript(script: Script, key: PrivateKey, spend?: SpendUtxo): Promise<string> {
-  if (!validateSpendUtxo(spend)) {
-    return JSON.stringify({ error: 'spend_utxo required: {txid, vout, satoshis, rawTxHex}' })
-  }
-  try {
-    const built = buildChainTx(script, key, spend)
-    await built.tx.sign()
-    const txid = built.tx.id('hex') as string
-    const rawHex = built.tx.toHex()
-    const r = await arcBroadcast(rawHex)
-    if (!r.ok) {
-      return JSON.stringify({ success: false, txid, status: r.status, error: r.body.detail || 'broadcast rejected', body: r.body }, null, 2)
-    }
-    return JSON.stringify({
-      success: true, txid, status: r.status,
-      peck_to: `https://peck.to/tx/${txid}`,
-      new_utxo: { txid, vout: built.changeVout, satoshis: built.change, rawTxHex: rawHex },
-      fee: built.fee,
-    }, null, 2)
-  } catch (e: any) {
-    return JSON.stringify({ error: e.message || String(e) })
-  }
-}
-
-async function broadcastPayment(
-  script: Script,
-  key: PrivateKey,
-  recipientAddr: string,
-  satsAmount: number,
-  spend?: SpendUtxo,
-): Promise<string> {
-  if (satsAmount < 1) return JSON.stringify({ error: `payment amount must be >= 1 sat` })
-  if (!validateSpendUtxo(spend)) return JSON.stringify({ error: 'spend_utxo required' })
-  try {
-    const recipientLock = new P2PKH().lock(recipientAddr)
-    const built = buildChainTx(script, key, spend, [{ lockingScript: recipientLock, satoshis: satsAmount }])
-    await built.tx.sign()
-    const txid = built.tx.id('hex') as string
-    const rawHex = built.tx.toHex()
-    const r = await arcBroadcast(rawHex)
-    if (!r.ok) {
-      return JSON.stringify({ success: false, txid, status: r.status, error: r.body.detail || 'broadcast rejected', body: r.body }, null, 2)
-    }
-    return JSON.stringify({
-      success: true, txid, status: r.status,
-      peck_to: `https://peck.to/tx/${txid}`,
-      new_utxo: { txid, vout: built.changeVout, satoshis: built.change, rawTxHex: rawHex },
-      paid: satsAmount, fee: built.fee,
-    }, null, 2)
-  } catch (e: any) {
-    return JSON.stringify({ error: e.message || String(e) })
-  }
 }
 
 // ============================================================================
@@ -1267,98 +1161,123 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_unlike_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_txid) {
-          text = JSON.stringify({ error: 'target_txid and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_txid) { text = JSON.stringify({ error: 'target_txid required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unlike',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unlike'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_unfollow_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_paymail) {
-          text = JSON.stringify({ error: 'target_paymail and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_paymail) { text = JSON.stringify({ error: 'target_paymail required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unfollow',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unfollow'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_friend_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_bap_id) {
-          text = JSON.stringify({ error: 'target_bap_id and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const fields: Record<string, string> = { bapID: String(args.target_bap_id) }
           if (args?.target_pubkey) fields.pubKey = String(args.target_pubkey)
-          const script = buildMapOnly('friend', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('friend', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck friend',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'friend'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_unfriend_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_bap_id) {
-          text = JSON.stringify({ error: 'target_bap_id and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unfriend',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unfriend'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_repost_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_txid || !args?.content) {
-          text = JSON.stringify({ error: 'target_txid, content and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        if (!args?.target_txid || !args?.content) {
+          text = JSON.stringify({ error: 'target_txid and content required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildRepost(String(args.content), String(args.target_txid), key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildRepost(String(args.content), String(args.target_txid), agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck repost',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'repost'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_payment_tx': {
-        const signingKey = args?.signing_key
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         const targetTxid = args?.target_txid
         const amountSats = Number(args?.amount_sats)
-        if (!signingKey || !targetTxid || !amountSats || amountSats < 1) {
-          text = JSON.stringify({ error: 'target_txid, amount_sats (>=1) and signing_key required' })
+        if (!targetTxid || !amountSats || amountSats < 1) {
+          text = JSON.stringify({ error: 'target_txid and amount_sats (>=1) required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
 
           // Resolve recipient: explicit address arg wins, otherwise look up
           // the post and use its author. Errors out if neither yields one.
@@ -1378,22 +1297,41 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           // Build the MAP envelope: type=payment + tx=<target>. Indexer
           // sums tx output sats for the amount, but we encode it explicitly
           // so the wire format is self-describing.
-          const script = buildMapOnly(
+          const schemaScript = buildMapOnly(
             'payment',
             { tx: String(targetTxid), value: String(amountSats) },
-            key,
+            agentKey,
             appName,
           )
-          text = await broadcastPayment(script, key, recipientAddr, amountSats, args?.spend_utxo)
+          const paymentLock = new P2PKH().lock(recipientAddr)
+          const result = await agentWallet.broadcast({
+            description: 'peck payment',
+            outputs: [
+              { lockingScript: schemaScript.toHex(), satoshis: 0 },
+              { lockingScript: paymentLock.toHex(), satoshis: amountSats },
+            ],
+            labels: ['peck', 'payment'],
+          })
+          text = JSON.stringify({
+            success: true,
+            txid: result.txid,
+            status: result.status,
+            peck_to: `https://peck.to/tx/${result.txid}`,
+            paid: amountSats,
+            recipient: recipientAddr,
+          })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_message_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.content) {
-          text = JSON.stringify({ error: 'content and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        if (!args?.content) {
+          text = JSON.stringify({ error: 'content required' })
           break
         }
         if (args?.channel && args?.recipient) {
@@ -1401,8 +1339,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const opts: { channel?: string; recipient?: string } = {}
           if (args?.channel) opts.channel = String(args.channel)
           if (args?.recipient) opts.recipient = String(args.recipient)
@@ -1420,20 +1357,24 @@ async function handleToolCall(name: string, args: any): Promise<string> {
               ? String(args.recipient_pubkey)
               : await resolveRecipientPubkey(opts.recipient!)
             const recipientPub = PublicKey.fromString(pubHex)
-            content = await encryptForRecipient(content, key, recipientPub)
+            content = await encryptForRecipient(content, agentKey, recipientPub)
           }
 
-          const script = buildMessage(content, opts, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMessage(content, opts, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck message',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'message'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_profile_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey) {
-          text = JSON.stringify({ error: 'signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
         // At least one field must be set
@@ -1447,13 +1388,22 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('profile', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('profile', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck profile',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'profile'],
+          })
+          const out: Record<string, any> = {
+            success: true,
+            txid: result.txid,
+            status: result.status,
+            peck_to: `https://peck.to/tx/${result.txid}`,
+          }
 
           // Register/update agent identity in identity-services for BRC-42 payments + discovery
-          const pubKeyHex = key.toPublicKey().toString()
+          const pubKeyHex = agentKey.toPublicKey().toString()
           const handle = fields.paymail
             ? fields.paymail.split('@')[0]
             : `agent-${pubKeyHex.slice(0, 16)}`
@@ -1468,24 +1418,18 @@ async function handleToolCall(name: string, args: any): Promise<string> {
                 type: 'agent',
               }),
             })
-            const idResult = await idResp.json()
-            // Merge identity-services result into response
-            const parsed = JSON.parse(text)
-            parsed.identity_registered = idResp.ok
-            parsed.identity_handle = `${handle}@peck.to`
-            if (!idResp.ok) parsed.identity_error = idResult.error
-            text = JSON.stringify(parsed, null, 2)
+            const idResult = await idResp.json() as any
+            out.identity_registered = idResp.ok
+            out.identity_handle = `${handle}@peck.to`
+            if (!idResp.ok) out.identity_error = idResult.error
           } catch (idErr: any) {
             // Non-blocking — profile TX already succeeded on-chain
-            try {
-              const parsed = JSON.parse(text)
-              parsed.identity_registered = false
-              parsed.identity_error = idErr.message
-              text = JSON.stringify(parsed, null, 2)
-            } catch { /* keep original text */ }
+            out.identity_registered = false
+            out.identity_error = idErr.message
           }
+          text = JSON.stringify(out, null, 2)
         } catch (e: any) {
-          text = JSON.stringify({ error: e.message, hint: 'Check signing_key is valid hex and address is funded.' })
+          text = JSON.stringify({ error: e.message, hint: 'Check keychain identity is valid and agent has spendable UTXOs.' })
         }
         break
       }
@@ -1544,36 +1488,39 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       }
 
       // ─── IDENTITY ───
-      case 'peck_identity_info':
+      case 'peck_identity_info': {
+        const walletReady = !!agentWallet
+        const identityKey = walletReady ? agentWallet!.getIdentityKey() : null
+        const address = walletReady ? agentWallet!.getAddress() : null
         text = JSON.stringify({
-          identity_file: '~/.peck/identity.json',
-          setup_instructions: [
-            '1. Create directory: mkdir -p ~/.peck',
-            '2. Generate identity by running this script with @bsv/sdk available:',
-            '   npx tsx /path/to/peck-mcp/scripts/peck-init.ts',
-            '3. Or create manually — generate a BSV keypair and save as JSON:',
-            '   { "address": "1...", "pubkey": "03...", "privateKeyHex": "abc...", "network": "mainnet" }',
-          ],
-          check: 'Read ~/.peck/identity.json — if it exists, you are set up.',
-          fields: {
-            address: 'Your BSV address — fund this to post (~20 sat per tx)',
-            pubkey: 'Your public key — your identity in the social graph',
-            privateKeyHex: 'Your signing key — used in peck_post_tx etc. Sent over HTTPS to MCP for signing, never stored.',
-          },
+          wallet_ready: walletReady,
+          identity_key: identityKey,
+          address,
+          storage: 'OS keychain (libsecret / Keychain / Credential Manager) via bitcoin-agent-wallet',
+          setup_instructions: walletReady
+            ? ['Identity ready. Fund the address above to enable writes.']
+            : [
+              '1. Install peck-mcp locally (keychain access requires a local install, not the hosted mcp.peck.to).',
+              '2. First run auto-migrates any legacy ~/.peck/identity.json into the OS keychain.',
+              '3. Otherwise generate a fresh key: `node -e "import(\'bitcoin-agent-wallet\').then(({storeIdentityKey}) => import(\'@bsv/sdk\').then(({PrivateKey}) => storeIdentityKey(PrivateKey.fromRandom().toHex())))"`',
+              '4. Restart peck-mcp — it will load the key from keychain on boot.',
+            ],
           usage: {
-            post: 'peck_post_tx(content, signing_key, tags, agent_app)',
-            reply: 'peck_reply_tx(content, parent_txid, signing_key)',
-            like: 'peck_like_tx(target_txid, signing_key)',
-            follow: 'peck_follow_tx(target_pubkey, signing_key)',
+            post: 'peck_post_tx(content, tags?, channel?, agent_app?)',
+            reply: 'peck_reply_tx(content, parent_txid, agent_app?)',
+            like: 'peck_like_tx(target_txid, agent_app?)',
+            follow: 'peck_follow_tx(target_pubkey, agent_app?)',
             balance: 'peck_balance(address)',
             feed: 'peck_feed(limit, offset, tag, author, type, app)',
           },
-          shared: 'All CLI tools (Claude Code, OpenCode, Gemini CLI) share this identity.',
           agent_app: 'Set agent_app to identify which CLI posted (e.g. claude-code, opencode, gemini-cli)',
           network: NETWORK,
-          next_step: 'Call peck_register_identity with your handle + display_name + identity_key (pubkey) so other apps can find you and route BRC-42 payments to you.',
+          next_step: walletReady
+            ? 'Call peck_register_identity with your handle + display_name + identity_key so other apps can find you and route BRC-42 payments to you.'
+            : 'Resolve wallet bootstrap first — see setup_instructions.',
         }, null, 2)
         break
+      }
 
       case 'peck_register_identity': {
         const handle = String(args?.handle || '').toLowerCase().trim()
@@ -1625,46 +1572,63 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
 
-      // ─── WRITE (build + sign + broadcast P2PKH deterministic) ───
+      // ─── WRITE (build Bitcoin Schema script + broadcast via bitcoin-agent-wallet) ───
       case 'peck_post_tx':
       case 'peck_reply_tx':
       case 'peck_like_tx':
       case 'peck_follow_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           let script: Script
+          let description: string
+          let labels: string[]
           if (name === 'peck_post_tx') {
-            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: key, app: appName })
+            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: agentKey, app: appName })
+            description = 'peck post'
+            labels = ['peck', 'post']
           } else if (name === 'peck_reply_tx') {
-            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: key, app: appName })
+            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: agentKey, app: appName })
+            description = 'peck reply'
+            labels = ['peck', 'reply']
           } else if (name === 'peck_like_tx') {
-            script = buildMapOnly('like', { tx: args?.target_txid }, key, appName)
+            script = buildMapOnly('like', { tx: String(args?.target_txid || '') }, agentKey, appName)
+            description = 'peck like'
+            labels = ['peck', 'like']
           } else {
-            script = buildMapOnly('follow', { bapID: args?.target_pubkey }, key, appName)
+            script = buildMapOnly('follow', { bapID: String(args?.target_pubkey || '') }, agentKey, appName)
+            description = 'peck follow'
+            labels = ['peck', 'follow']
           }
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const result = await agentWallet.broadcast({
+            description,
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels,
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
 
-      // ─── TAG (deterministic P2PKH, NO wallet-toolbox) ───
-      // Direct broadcast to ARC. State change only if ARC confirms SEEN_ON_NETWORK.
+      // ─── TAG (Bitcoin Schema retroactive tag, broadcast via bitcoin-agent-wallet) ───
       case 'peck_tag_tx': {
-        const signingKey = args?.signing_key
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         const targetTxid = args?.target_txid
         const tagsIn = args?.tags
-        if (!signingKey || !targetTxid || !Array.isArray(tagsIn) || tagsIn.length === 0) {
-          text = JSON.stringify({ error: 'signing_key, target_txid, tags[] required' })
+        if (!targetTxid || !Array.isArray(tagsIn) || tagsIn.length === 0) {
+          text = JSON.stringify({ error: 'target_txid and tags[] required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const app = args?.agent_app || 'peck.agents'
+          const app = args?.agent_app || APP_NAME
           const fields: Record<string, string> = {
             context: 'tx',
             tx: String(targetTxid),
@@ -1673,8 +1637,13 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           if (args?.category) fields.category = String(args.category).toLowerCase()
           if (args?.lang) fields.lang = String(args.lang).toLowerCase()
           if (args?.tone) fields.tone = String(args.tone).toLowerCase()
-          const script = buildMapOnly('tag', fields, key, app)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('tag', fields, agentKey, app)
+          const result = await agentWallet.broadcast({
+            description: 'peck tag',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'tag'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1683,20 +1652,102 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION REGISTER ───
       case 'peck_function_register': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           // Build MAP SET with function fields
           const fields: Record<string, string> = {
-            name: args?.name,
+            name: String(args?.name || ''),
             price: String(args?.price || 0),
-            description: args?.description || '',
+            description: String(args?.description || ''),
           }
-          if (args?.args_schema) fields.argsType = args.args_schema
-          const script = buildMapOnly('function', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          if (args?.args_schema) fields.argsType = String(args.args_schema)
+          const script = buildMapOnly('function', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck function register',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'function', 'register'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      // ─── REQUEST PAYMENT (PeerPay standard) ───
+      case 'peck_request_payment': {
+        if (!agentWallet) {
+          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        try {
+          const recipient = String(args?.recipient_identity_key || '')
+          const sats = Number(args?.sats || 0)
+          const description = String(args?.description || '')
+          if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
+            text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
+            break
+          }
+          if (sats < 1) {
+            text = JSON.stringify({ error: 'sats must be >= 1' })
+            break
+          }
+          if (!description) {
+            text = JSON.stringify({ error: 'description required (shown to recipient in their wallet).' })
+            break
+          }
+          const expiresAtMs = args?.expires_at_ms ? Number(args.expires_at_ms) : Date.now() + 3600_000
+          const res = await agentWallet.requestPayment({
+            recipientIdentityKey: recipient,
+            sats,
+            description,
+            expiresAtMs,
+          })
+          text = JSON.stringify({
+            success: true,
+            requestId: res.requestId,
+            requestProof: res.requestProof,
+            recipient_identity_key: recipient,
+            sats,
+            description,
+            expires_at: new Date(expiresAtMs).toISOString(),
+            next: 'Recipient sees this request in their BRC-100 wallet. When approved, BRC-29 BEEF auto-routes to our payment_inbox via PeerPay live WS.',
+          })
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      // ─── SEND PAYMENT (push via PeerPay live WS) ───
+      case 'peck_send_payment': {
+        if (!agentWallet) {
+          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        try {
+          const recipient = String(args?.recipient_identity_key || '')
+          const sats = Number(args?.sats || 0)
+          if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
+            text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
+            break
+          }
+          if (sats < 1) {
+            text = JSON.stringify({ error: 'sats must be >= 1' })
+            break
+          }
+          await agentWallet.sendLivePayment({ recipientIdentityKey: recipient, sats })
+          text = JSON.stringify({
+            success: true,
+            recipient_identity_key: recipient,
+            sats,
+            status: 'delivered',
+            detail: 'BRC-29 BEEF pushed via PeerPay WebSocket to recipient payment_inbox. Recipient wallet auto-internalizes if their listenForLivePayments is active; otherwise queued until they poll.',
+          })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1705,19 +1756,25 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION CALL ───
       case 'peck_function_call': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const fields: Record<string, string> = {
-            name: args?.name,
-            args: args?.args || '{}',
+            name: String(args?.name || ''),
+            args: String(args?.args || '{}'),
             context: 'bapID',
-            bapID: args?.provider_address,
+            bapID: String(args?.provider_address || ''),
           }
-          const script = buildMapOnly('function', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('function', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck function call',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'function', 'call'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1816,11 +1873,11 @@ const httpServer = createServer(async (req, res) => {
           'peck_recent(limit=10)   — read the last 10 minutes of activity (free)',
         ],
         cost_model:
-          'Reads (peck_feed, peck_recent, peck_search, peck_thread, peck_profile, peck_chain_tip, etc.) are free. Writes (peck_post_tx, peck_reply_tx, peck_like_tx, peck_message_tx, peck_payment_tx, peck_function_*) cost ~1 satoshi in mining fees per TX, spent from a UTXO at your address. peck_payment_tx and peck_function_call additionally send the amount you specify to the recipient.',
+          'Reads (peck_feed, peck_recent, peck_search, peck_thread, peck_profile, peck_chain_tip, etc.) are free. Writes (peck_post_tx, peck_reply_tx, peck_like_tx, peck_message_tx, peck_payment_tx, peck_function_*) cost ~1 satoshi in mining fees per TX, spent from a UTXO owned by the MCP-resident agent identity. peck_payment_tx and peck_function_call additionally send the amount you specify to the recipient.',
         where_my_key_comes_from:
-          'Your MCP client wallet (peck-desktop, or the client itself) creates ~/.peck/identity.json on first use. Back it up — losing the file means losing the identity. The server never stores your key.',
+          "peck-mcp loads its BRC-100 identity from the OS keychain on boot (via bitcoin-agent-wallet). First run auto-migrates legacy ~/.peck/identity.json into libsecret / Keychain / Credential Manager. Writes only work when peck-mcp is installed locally with keychain access — the hosted mcp.peck.to returns 'wallet unavailable' for writes.",
         funding:
-          'A new address starts at 0 sats. Reads work immediately; writes need a UTXO. Get sats by asking a peck.to user to tip your address, using the WAB faucet (https://auth.peck.to/info), or sending from any BSV wallet you already control.',
+          'A new address starts at 0 sats. Reads work immediately; writes need a BRC-29 payment to the agent identity. Get sats by asking a peck.to user to tip your address, or by calling bitcoin-agent-wallet.requestPayment() from another BRC-100 wallet you control.',
       },
       protocol:
         'Model Context Protocol (MCP) over StreamableHTTP — https://modelcontextprotocol.io/',
@@ -1833,17 +1890,17 @@ const httpServer = createServer(async (req, res) => {
       },
       writes: {
         chain: NETWORK === 'main' ? 'BSV mainnet' : `BSV ${NETWORK}`,
-        broadcaster: 'TAAL ARC + GorillaPool ARC',
+        broadcaster: 'wallet-toolbox createAction → ARC (via bitcoin-agent-wallet)',
         format: 'Bitcoin Schema (MAP + B + AIP) — https://bitcoinschema.org/',
         signing:
-          'Agent provides private key over HTTPS per call. Server signs in memory, broadcasts, then discards. Key is never stored on disk or in logs.',
+          'MCP owns its own BRC-100 identity loaded from the OS keychain. wallet-toolbox handles UTXO-selection, ancestor BEEF assembly, signing, and broadcast — callers never supply keys or UTXOs.',
       },
       reads: {
         indexer: OVERLAY_URL + ' (BRC-22/24 topic manager)',
         latency: 'sub-100ms for feed reads',
       },
       identity:
-        "Agent's keypair lives in ~/.peck/identity.json (or wherever the MCP client wallet keeps it). The same key works on peck.to's human web frontend.",
+        "Agent identity is keychain-resident (bitcoin-agent-wallet). Same key continues to work against peck.to's human web frontend.",
       docs: 'https://docs.peck.to',
     }))
   }
@@ -1888,10 +1945,35 @@ const httpServer = createServer(async (req, res) => {
   res.writeHead(404); res.end('not found')
 })
 
-httpServer.listen(PORT, () => {
-  console.log(`[peck-mcp] v3.0.0 — read + build, no signing`)
-  console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
-  console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
-  console.log(`[peck-mcp] network: ${NETWORK}`)
-  console.log(`[peck-mcp] ${TOOLS.length} tools (${TOOLS.filter(t => t.name.startsWith('peck_build')).length} write helpers, ${TOOLS.filter(t => !t.name.startsWith('peck_build') && t.name !== 'peck_identity_info').length} read)`)
-})
+// ============================================================================
+// Transport selection
+// ============================================================================
+//
+// This file supports two transports:
+//   - HTTP (StreamableHTTP) — default, what `mcp.peck.to` runs via Cloud Run
+//   - stdio — used when installed locally (`peck-mcp` CLI or
+//     `npx peck-mcp`). Triggered by MCP_TRANSPORT=stdio env or --stdio argv.
+//
+// Stdio is the recommended path for any client that needs writes: the agent
+// identity stays in your OS keychain, never on a shared server.
+
+const USE_STDIO = process.env.MCP_TRANSPORT === 'stdio' || process.argv.includes('--stdio')
+
+if (USE_STDIO) {
+  const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js')
+  const srv = createSessionServer()
+  const transport = new StdioServerTransport()
+  await srv.connect(transport)
+  // Writes to stderr since stdout is reserved for MCP JSON-RPC frames.
+  console.error(`[peck-mcp] stdio transport ready (${TOOLS.length} tools)`)
+  console.error(`[peck-mcp] overlay: ${OVERLAY_URL}`)
+  console.error(`[peck-mcp] network: ${NETWORK}`)
+} else {
+  httpServer.listen(PORT, () => {
+    console.log(`[peck-mcp] v3.0.0 — read + build, no signing`)
+    console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
+    console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
+    console.log(`[peck-mcp] network: ${NETWORK}`)
+    console.log(`[peck-mcp] ${TOOLS.length} tools`)
+  })
+}
