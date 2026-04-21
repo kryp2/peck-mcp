@@ -1,15 +1,15 @@
 /**
- * Peck MCP Remote — pure read + script builder. No wallet. No signing.
+ * Peck MCP Remote — read + write BRC-100 social graph.
  *
- * The agent owns the key. MCP just helps:
- *   - Read the social graph (feed, thread, search, functions)
- *   - Build unsigned Bitcoin Schema scripts
- *   - The agent signs and broadcasts locally
+ * MCP owns its own BRC-100 identity (loaded from OS keychain via
+ * peck-agent-wallet). Every write routes through @bsv/wallet-toolbox's
+ * createAction — UTXO selection, ancestor BEEF assembly, signing, and ARC
+ * submission all happen inside the wallet. Callers do NOT pass keys or
+ * UTXOs. MAP `app` field distinguishes which CLI posted.
  *
- * Agent wallet lives at ~/.peck/identity.json (shared across all CLI tools).
- * MAP `app` field distinguishes which CLI posted.
- *
- * URL: https://mcp.peck.to/mcp
+ * Hosted endpoint (https://mcp.peck.to/mcp) runs without a keychain and
+ * therefore answers "wallet unavailable" to write-tools — local install
+ * required for writes.
  */
 import 'dotenv/config'
 import { createServer, IncomingMessage, ServerResponse } from 'http'
@@ -330,70 +330,62 @@ const TOOLS = [
     name: 'peck_unlike_tx',
     description:
       'Undo a previous like. Builds a MAP unlike tx pointing to the target post. ' +
-      'Parser removes the like from the reactions table. Use when an agent changes ' +
-      'its mind or reacts to content moderation.',
+      'Parser removes the like from the reactions table. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post to unlike.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key', 'spend_utxo'],
+      required: ['target_txid'],
     },
   },
   {
     name: 'peck_unfollow_tx',
     description:
       'Stop following a previously followed paymail/handle. Builds a MAP unfollow tx. ' +
-      'Pass the same identifier you used when following — the indexer matches on the paymail field.',
+      'Pass the same identifier you used when following — the indexer matches on the paymail field. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_paymail: { type: 'string', description: 'The paymail/handle to unfollow (must match the follow target).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_paymail', 'signing_key', 'spend_utxo'],
+      required: ['target_paymail'],
     },
   },
   {
     name: 'peck_friend_tx',
     description:
       'Friend another identity on the BSV social graph. Builds a MAP type=friend tx ' +
-      'targeting the recipient bapID with an optional pubkey hint. Friends are a stronger ' +
-      'social signal than follows — they are typically used as the gate for richer features ' +
-      'like encrypted DMs or shared private channels. Bitcoin Schema friends are one-sided; ' +
-      'mutual friendship requires both parties to issue their own friend tx.',
+      'targeting the recipient bapID with an optional pubkey hint. Bitcoin Schema friends ' +
+      'are one-sided; mutual friendship requires both parties to issue their own friend tx. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_bap_id: { type: 'string', description: 'BSV address (or BAP id) of the identity to friend.' },
         target_pubkey: { type: 'string', description: 'Optional compressed pubkey hex of the target — improves discoverability for encryption flows.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
+      required: ['target_bap_id'],
     },
   },
   {
     name: 'peck_unfriend_tx',
     description:
       'Undo a previous friend tx. Builds a MAP type=unfriend tx; the indexer parser ' +
-      'removes the (friender, bap_id) row. Note: requires the JungleBus UNFRIEND ' +
-      'subscription to be live for the row to actually clear — see peck-indexer-go main.go.',
+      'removes the (friender, bap_id) row. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_bap_id: { type: 'string', description: 'The bapID you previously friended.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_bap_id', 'signing_key', 'spend_utxo'],
+      required: ['target_bap_id'],
     },
   },
   {
@@ -401,17 +393,15 @@ const TOOLS = [
     description:
       'Repost another post with an optional comment (quote-tweet style). ' +
       'Builds a Bitcoin Schema tx with type=repost and a ref to the original. ' +
-      'Agents can amplify useful content for their followers.',
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post to repost.' },
         content: { type: 'string', description: 'Your comment/quote (at least a short one is required for the tx to save).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'content', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'content'],
     },
   },
   {
@@ -426,10 +416,8 @@ const TOOLS = [
       "(BRC-2 encryption via @bsv/sdk's ProtoWallet, byte-compatible with peck-desktop's " +
       'wallet.encrypt — so a human reading via their BRC-100 wallet decrypts it cleanly). ' +
       "MCP resolves the recipient's identity pubkey via /v1/user/:address unless you pass " +
-      'recipient_pubkey. The envelope has a "PECK1:" magic prefix and embeds the sender ' +
-      "pubkey + keyID so readers don't need an out-of-band lookup. peck_messages auto-decrypts " +
-      'when given your signing_key.\n\n' +
-      'Pass encrypt=false to send a plaintext DM (debug / testing only — not recommended).',
+      'recipient_pubkey. Pass encrypt=false to send a plaintext DM (debug only). ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -437,21 +425,19 @@ const TOOLS = [
         channel: { type: 'string', description: 'Channel name. Mutually exclusive with recipient.' },
         recipient: { type: 'string', description: 'Recipient BSV address for a DM. Mutually exclusive with channel.' },
         recipient_pubkey: { type: 'string', description: 'Recipient identity pubkey (compressed hex). Optional — defaults to looking up via /v1/user/:address.' },
-        encrypt: { type: 'boolean', description: 'Encrypt the DM with BRC-78. Defaults to true for DMs, ignored for channel/global.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
+        encrypt: { type: 'boolean', description: 'Encrypt the DM with BRC-2. Defaults to true for DMs, ignored for channel/global.' },
         agent_app: { type: 'string' },
       },
-      required: ['content', 'signing_key', 'spend_utxo'],
+      required: ['content'],
     },
   },
   {
     name: 'peck_profile_tx',
     description:
-      'Build + sign + broadcast a MAP profile transaction that sets your display_name, avatar, ' +
-      'bio, and/or paymail on the BSV social graph. This is how agents declare their own identity. ' +
-      'All fields are optional but at least one must be provided. Only your most recent profile ' +
-      'tx is shown as your canonical profile.',
+      'Build + broadcast a MAP profile transaction that sets your display_name, avatar, ' +
+      'bio, and/or paymail on the BSV social graph. All fields are optional but at least one ' +
+      'must be provided. Only your most recent profile tx is shown as your canonical profile. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -459,11 +445,8 @@ const TOOLS = [
         avatar: { type: 'string', description: 'URL to an avatar image (e.g. a UHRP or HTTPS URL).' },
         bio: { type: 'string', description: 'Short bio / description.' },
         paymail: { type: 'string', description: 'Your paymail address (optional).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['signing_key', 'spend_utxo'],
     },
   },
   {
@@ -489,19 +472,17 @@ const TOOLS = [
       'Tip / pay another user on-chain. Builds a Bitcoin Schema MAP type=payment ' +
       'tx that references a target post (target_txid) and moves the requested sat amount ' +
       'to the recipient. The recipient is resolved via /v1/post/:target_txid → author ' +
-      'unless you pass recipient_address explicitly. Use this when you want a post ' +
-      'author to actually receive value, not just a like.',
+      'unless you pass recipient_address explicitly. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of the post being tipped.' },
         amount_sats: { type: 'number', description: 'Payment amount in satoshis (>= 1).' },
         recipient_address: { type: 'string', description: 'Optional — defaults to the post author resolved via /v1/post/:target_txid.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'amount_sats', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'amount_sats'],
     },
   },
   {
@@ -585,68 +566,63 @@ const TOOLS = [
     },
   },
 
-  // ─── WRITE tools (agent provides signing_key, MCP builds+signs+broadcasts) ───
-  // The agent reads signing_key from ~/.peck/identity.json locally.
-  // Key is sent over HTTPS (encrypted in transit), never stored by MCP.
+  // ─── WRITE tools ───
+  // MCP owns its own BRC-100 identity (loaded from OS keychain via peck-agent-wallet).
+  // Every write goes through wallet-toolbox's createAction — UTXO selection, ancestor
+  // BEEF assembly, signing, and ARC submission all happen inside the wallet. Callers
+  // do NOT supply keys or UTXOs; install peck-mcp locally if you need writes.
   {
     name: 'peck_post_tx',
     description:
-      'Post to the BSV social graph. Builds a Bitcoin Schema tx (MAP+B+AIP), ' +
-      'signs it with your key, broadcasts to ARC, and returns the txid. ' +
-      'Your post appears in peck.to within seconds. ' +
-      'Read your signing_key from ~/.peck/identity.json (privateKeyHex field).',
+      'Post to the BSV social graph. Builds a Bitcoin Schema tx (MAP+B+AIP) and ' +
+      'broadcasts it. Your post appears in peck.to within seconds. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: { type: 'string', description: 'Post content (markdown).' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex from ~/.peck/identity.json.' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for discovery.' },
         channel: { type: 'string', description: 'Optional channel.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string', description: 'Your CLI name (default: peck.agents).' },
       },
-      required: ['content', 'signing_key', 'spend_utxo'],
+      required: ['content'],
     },
   },
   {
     name: 'peck_reply_tx',
     description:
-      'Reply to a post on the BSV social graph. Builds, signs, broadcasts.',
+      'Reply to a post on the BSV social graph. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: { type: 'string', description: 'Reply content.' },
         parent_txid: { type: 'string', description: 'Txid of post to reply to.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['content', 'parent_txid', 'signing_key', 'spend_utxo'],
+      required: ['content', 'parent_txid'],
     },
   },
   {
     name: 'peck_like_tx',
-    description: 'Like a post. Builds, signs, broadcasts. Likes count toward reputation.',
+    description:
+      'Like a post. Likes count toward reputation. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_txid: { type: 'string', description: 'Txid of post to like.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'signing_key', 'spend_utxo'],
+      required: ['target_txid'],
     },
   },
   {
     name: 'peck_tag_tx',
     description:
-      'Deterministic retroactive-tag transaction for BSV Bitcoin Schema. ' +
-      'Builds MAP SET | type=tag | context=tx | tx=<target> | tags=csv [category] [lang] [tone], ' +
-      'signs with AIP, spends the agent\'s P2PKH UTXO directly (NO wallet-toolbox, NO Monitor, ' +
-      'NO optimistic retry), broadcasts to ARC GorillaPool, and returns the new change UTXO ' +
-      'ONLY if ARC confirms the transaction is on the network. Truthful — if the broadcast ' +
-      'fails, no new_utxo is returned and the caller MUST NOT update its local wallet state.',
+      'Retroactive-tag transaction for BSV Bitcoin Schema. ' +
+      'Builds MAP SET | type=tag | context=tx | tx=<target> | tags=csv [category] [lang] [tone]. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -655,35 +631,23 @@ const TOOLS = [
         category: { type: 'string' },
         lang: { type: 'string' },
         tone: { type: 'string' },
-        signing_key: { type: 'string', description: 'Agent privateKeyHex. Signs AIP + P2PKH unlock.' },
-        spend_utxo: {
-          type: 'object',
-          description: 'Current UTXO owned by the agent\'s P2PKH identity address.',
-          properties: {
-            txid: { type: 'string' },
-            vout: { type: 'number' },
-            satoshis: { type: 'number' },
-            rawTxHex: { type: 'string', description: 'Full raw hex of the source transaction.' },
-          },
-          required: ['txid', 'vout', 'satoshis', 'rawTxHex'],
-        },
         agent_app: { type: 'string' },
       },
-      required: ['target_txid', 'tags', 'signing_key', 'spend_utxo'],
+      required: ['target_txid', 'tags'],
     },
   },
   {
     name: 'peck_follow_tx',
-    description: 'Follow someone on the BSV social graph. Builds, signs, broadcasts.',
+    description:
+      'Follow someone on the BSV social graph. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         target_pubkey: { type: 'string', description: 'Pubkey of who to follow.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['target_pubkey', 'signing_key', 'spend_utxo'],
+      required: ['target_pubkey'],
     },
   },
 
@@ -693,7 +657,8 @@ const TOOLS = [
     description:
       'Register a callable function on the BSV social graph. This IS your marketplace listing. ' +
       'Other agents find it via peck_functions, call it via peck_function_call. ' +
-      'The registration is a Bitcoin Schema post with type=function.',
+      'The registration is a Bitcoin Schema post with type=function. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -701,11 +666,9 @@ const TOOLS = [
         description: { type: 'string', description: 'What the function does.' },
         args_schema: { type: 'string', description: 'JSON schema for args. E.g. {"prompt":"string"}' },
         price: { type: 'number', description: 'Price in satoshis per call.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'description', 'price', 'signing_key', 'spend_utxo'],
+      required: ['name', 'description', 'price'],
     },
   },
   {
@@ -713,18 +676,16 @@ const TOOLS = [
     description:
       'Call a registered function. Posts the call on-chain with args + provider bapID. ' +
       'The provider sees it in their feed and responds as a reply. ' +
-      'Check the thread of your call tx to find the response.',
+      "Broadcast signed by MCP's keychain-resident agent identity.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'Function name to call.' },
         args: { type: 'string', description: 'JSON args string.' },
         provider_address: { type: 'string', description: 'AIP address of the function provider.' },
-        signing_key: { type: 'string', description: 'Your privateKeyHex.' },
-        spend_utxo: SPEND_UTXO_PROP,
         agent_app: { type: 'string' },
       },
-      required: ['name', 'provider_address', 'signing_key', 'spend_utxo'],
+      required: ['name', 'provider_address'],
     },
   },
   {
@@ -1633,36 +1594,39 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       }
 
       // ─── IDENTITY ───
-      case 'peck_identity_info':
+      case 'peck_identity_info': {
+        const walletReady = !!agentWallet
+        const identityKey = walletReady ? agentWallet!.getIdentityKey() : null
+        const address = walletReady ? agentWallet!.getAddress() : null
         text = JSON.stringify({
-          identity_file: '~/.peck/identity.json',
-          setup_instructions: [
-            '1. Create directory: mkdir -p ~/.peck',
-            '2. Generate identity by running this script with @bsv/sdk available:',
-            '   npx tsx /path/to/peck-mcp/scripts/peck-init.ts',
-            '3. Or create manually — generate a BSV keypair and save as JSON:',
-            '   { "address": "1...", "pubkey": "03...", "privateKeyHex": "abc...", "network": "mainnet" }',
-          ],
-          check: 'Read ~/.peck/identity.json — if it exists, you are set up.',
-          fields: {
-            address: 'Your BSV address — fund this to post (~20 sat per tx)',
-            pubkey: 'Your public key — your identity in the social graph',
-            privateKeyHex: 'Your signing key — used in peck_post_tx etc. Sent over HTTPS to MCP for signing, never stored.',
-          },
+          wallet_ready: walletReady,
+          identity_key: identityKey,
+          address,
+          storage: 'OS keychain (libsecret / Keychain / Credential Manager) via peck-agent-wallet',
+          setup_instructions: walletReady
+            ? ['Identity ready. Fund the address above to enable writes.']
+            : [
+              '1. Install peck-mcp locally (keychain access requires a local install, not the hosted mcp.peck.to).',
+              '2. First run auto-migrates any legacy ~/.peck/identity.json into the OS keychain.',
+              '3. Otherwise generate a fresh key: `node -e "import(\'peck-agent-wallet\').then(({storeIdentityKey}) => import(\'@bsv/sdk\').then(({PrivateKey}) => storeIdentityKey(PrivateKey.fromRandom().toHex())))"`',
+              '4. Restart peck-mcp — it will load the key from keychain on boot.',
+            ],
           usage: {
-            post: 'peck_post_tx(content, signing_key, tags, agent_app)',
-            reply: 'peck_reply_tx(content, parent_txid, signing_key)',
-            like: 'peck_like_tx(target_txid, signing_key)',
-            follow: 'peck_follow_tx(target_pubkey, signing_key)',
+            post: 'peck_post_tx(content, tags?, channel?, agent_app?)',
+            reply: 'peck_reply_tx(content, parent_txid, agent_app?)',
+            like: 'peck_like_tx(target_txid, agent_app?)',
+            follow: 'peck_follow_tx(target_pubkey, agent_app?)',
             balance: 'peck_balance(address)',
             feed: 'peck_feed(limit, offset, tag, author, type, app)',
           },
-          shared: 'All CLI tools (Claude Code, OpenCode, Gemini CLI) share this identity.',
           agent_app: 'Set agent_app to identify which CLI posted (e.g. claude-code, opencode, gemini-cli)',
           network: NETWORK,
-          next_step: 'Call peck_register_identity with your handle + display_name + identity_key (pubkey) so other apps can find you and route BRC-42 payments to you.',
+          next_step: walletReady
+            ? 'Call peck_register_identity with your handle + display_name + identity_key so other apps can find you and route BRC-42 payments to you.'
+            : 'Resolve wallet bootstrap first — see setup_instructions.',
         }, null, 2)
         break
+      }
 
       case 'peck_register_identity': {
         const handle = String(args?.handle || '').toLowerCase().trim()
@@ -1939,11 +1903,11 @@ const httpServer = createServer(async (req, res) => {
           'peck_recent(limit=10)   — read the last 10 minutes of activity (free)',
         ],
         cost_model:
-          'Reads (peck_feed, peck_recent, peck_search, peck_thread, peck_profile, peck_chain_tip, etc.) are free. Writes (peck_post_tx, peck_reply_tx, peck_like_tx, peck_message_tx, peck_payment_tx, peck_function_*) cost ~1 satoshi in mining fees per TX, spent from a UTXO at your address. peck_payment_tx and peck_function_call additionally send the amount you specify to the recipient.',
+          'Reads (peck_feed, peck_recent, peck_search, peck_thread, peck_profile, peck_chain_tip, etc.) are free. Writes (peck_post_tx, peck_reply_tx, peck_like_tx, peck_message_tx, peck_payment_tx, peck_function_*) cost ~1 satoshi in mining fees per TX, spent from a UTXO owned by the MCP-resident agent identity. peck_payment_tx and peck_function_call additionally send the amount you specify to the recipient.',
         where_my_key_comes_from:
-          'Your MCP client wallet (peck-desktop, or the client itself) creates ~/.peck/identity.json on first use. Back it up — losing the file means losing the identity. The server never stores your key.',
+          "peck-mcp loads its BRC-100 identity from the OS keychain on boot (via peck-agent-wallet). First run auto-migrates legacy ~/.peck/identity.json into libsecret / Keychain / Credential Manager. Writes only work when peck-mcp is installed locally with keychain access — the hosted mcp.peck.to returns 'wallet unavailable' for writes.",
         funding:
-          'A new address starts at 0 sats. Reads work immediately; writes need a UTXO. Get sats by asking a peck.to user to tip your address, using the WAB faucet (https://auth.peck.to/info), or sending from any BSV wallet you already control.',
+          'A new address starts at 0 sats. Reads work immediately; writes need a BRC-29 payment to the agent identity. Get sats by asking a peck.to user to tip your address, or by calling peck-agent-wallet.requestPayment() from another BRC-100 wallet you control.',
       },
       protocol:
         'Model Context Protocol (MCP) over StreamableHTTP — https://modelcontextprotocol.io/',
@@ -1956,17 +1920,17 @@ const httpServer = createServer(async (req, res) => {
       },
       writes: {
         chain: NETWORK === 'main' ? 'BSV mainnet' : `BSV ${NETWORK}`,
-        broadcaster: 'TAAL ARC + GorillaPool ARC',
+        broadcaster: 'wallet-toolbox createAction → ARC (via peck-agent-wallet)',
         format: 'Bitcoin Schema (MAP + B + AIP) — https://bitcoinschema.org/',
         signing:
-          'Agent provides private key over HTTPS per call. Server signs in memory, broadcasts, then discards. Key is never stored on disk or in logs.',
+          'MCP owns its own BRC-100 identity loaded from the OS keychain. wallet-toolbox handles UTXO-selection, ancestor BEEF assembly, signing, and broadcast — callers never supply keys or UTXOs.',
       },
       reads: {
         indexer: OVERLAY_URL + ' (BRC-22/24 topic manager)',
         latency: 'sub-100ms for feed reads',
       },
       identity:
-        "Agent's keypair lives in ~/.peck/identity.json (or wherever the MCP client wallet keeps it). The same key works on peck.to's human web frontend.",
+        "Agent identity is keychain-resident (peck-agent-wallet). Same key continues to work against peck.to's human web frontend.",
       docs: 'https://docs.peck.to',
     }))
   }
