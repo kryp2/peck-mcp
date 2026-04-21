@@ -686,6 +686,44 @@ const TOOLS = [
     },
   },
   {
+    name: 'peck_request_payment',
+    description:
+      'Ask a recipient for a BRC-29 payment via the standard PeerPay payment_requests messagebox. ' +
+      'Their BRC-100 wallet (BSV Desktop, Babbage, bsv-browser) shows it as an incoming request; ' +
+      'when they approve, sendLivePayment routes BRC-29 BEEF back to our payment_inbox and the ' +
+      'live listener auto-internalizes it. Returns {requestId, requestProof}. ' +
+      "Broadcast signed by MCP's keychain-resident agent identity.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        recipient_identity_key: { type: 'string', description: '66-hex compressed pubkey of the payer.' },
+        sats: { type: 'number', description: 'Requested amount in satoshis.' },
+        description: { type: 'string', description: 'Human-readable reason shown in recipient wallet.' },
+        expires_at_ms: { type: 'number', description: 'Unix ms when the request expires. Default: now + 1h.' },
+      },
+      required: ['recipient_identity_key', 'sats', 'description'],
+    },
+  },
+  {
+    name: 'peck_send_payment',
+    description:
+      'Push a BRC-29 payment to a recipient over PeerPay live WS — the inverse of peck_request_payment. ' +
+      'Uses wallet-toolbox createAction internally (deducts from our spendable balance), wraps the signed ' +
+      'BEEF in a PeerPay PaymentToken with derivation metadata, and delivers it to the recipient\'s ' +
+      'payment_inbox. If their listenForLivePayments is active, their wallet auto-internalizes within ~100ms. ' +
+      'Use for agent-initiated payments: refunds after failed tasks, tips, agent-to-agent settlements. ' +
+      "Requires sufficient spendable balance for amount + network fee. Broadcast signed by MCP's " +
+      'keychain-resident agent identity.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        recipient_identity_key: { type: 'string', description: '66-hex compressed pubkey of the payee.' },
+        sats: { type: 'number', description: 'Amount to send in satoshis (>= 1).' },
+      },
+      required: ['recipient_identity_key', 'sats'],
+    },
+  },
+  {
     name: 'peck_function_call',
     description:
       'Call a registered function. Posts the call on-chain with args + provider bapID. ' +
@@ -1634,6 +1672,82 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             labels: ['peck', 'function', 'register'],
           })
           text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      // ─── REQUEST PAYMENT (PeerPay standard) ───
+      case 'peck_request_payment': {
+        if (!agentWallet) {
+          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        try {
+          const recipient = String(args?.recipient_identity_key || '')
+          const sats = Number(args?.sats || 0)
+          const description = String(args?.description || '')
+          if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
+            text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
+            break
+          }
+          if (sats < 1) {
+            text = JSON.stringify({ error: 'sats must be >= 1' })
+            break
+          }
+          if (!description) {
+            text = JSON.stringify({ error: 'description required (shown to recipient in their wallet).' })
+            break
+          }
+          const expiresAtMs = args?.expires_at_ms ? Number(args.expires_at_ms) : Date.now() + 3600_000
+          const res = await agentWallet.requestPayment({
+            recipientIdentityKey: recipient,
+            sats,
+            description,
+            expiresAtMs,
+          })
+          text = JSON.stringify({
+            success: true,
+            requestId: res.requestId,
+            requestProof: res.requestProof,
+            recipient_identity_key: recipient,
+            sats,
+            description,
+            expires_at: new Date(expiresAtMs).toISOString(),
+            next: 'Recipient sees this request in their BRC-100 wallet. When approved, BRC-29 BEEF auto-routes to our payment_inbox via PeerPay live WS.',
+          })
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      // ─── SEND PAYMENT (push via PeerPay live WS) ───
+      case 'peck_send_payment': {
+        if (!agentWallet) {
+          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        try {
+          const recipient = String(args?.recipient_identity_key || '')
+          const sats = Number(args?.sats || 0)
+          if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
+            text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
+            break
+          }
+          if (sats < 1) {
+            text = JSON.stringify({ error: 'sats must be >= 1' })
+            break
+          }
+          await agentWallet.sendLivePayment({ recipientIdentityKey: recipient, sats })
+          text = JSON.stringify({
+            success: true,
+            recipient_identity_key: recipient,
+            sats,
+            status: 'delivered',
+            detail: 'BRC-29 BEEF pushed via PeerPay WebSocket to recipient payment_inbox. Recipient wallet auto-internalizes if their listenForLivePayments is active; otherwise queued until they poll.',
+          })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }

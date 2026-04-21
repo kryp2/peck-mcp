@@ -50,7 +50,7 @@
     "@bsv/sdk": "^2.0.13",
     "@bsv/wallet-toolbox": "^2.1.18",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "bitcoin-agent-wallet": "^0.3.0",
+    "bitcoin-agent-wallet": "^0.3.1",
     "dotenv": "^17.4.1",
     "eventsource": "^3.0.2",
     "express": "^4.21.2",
