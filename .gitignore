@@ -1,75 +1,63 @@
 node_modules/
 dist/
 
-# Secrets / wallets / env
+# Secrets / env
 .env
 .env.*
 !.env.example
 *.key
-.wallets.json
-.wallets-mainnet.json
-.brc-identities.json
-.autonomous-agents.json
-.fleet-funder.json
-.fleet-profiles.json
-.bible-roots.json
-
-# Runtime state
-.worktrees/
-.ladder-state/
-.peck-state/
-.agent-wallets/
-.wallet-storage/
-.bible-data/
-.bible-progress/
-.bible-liker-state/
-.bible-retro-state/
-.classics-data/
-.cross-ref-data/
-.cross-ref-state/
-.peck-commentator-state/
-.peck-evangelist-state/
-.bsv-archivist-state/
-.smart-tagger-state/
-.wisdom-data/
-
-# Scratch / work-in-progress scripts (uncommitted)
-/probe_10min.ts
-/wallet_probe.ts
-/wallet_loop_probe.ts
-/wallet_spawn_fleet.ts
-/check_sig.ts
-/classics-actions.ts
+*.pem
 
 # OS junk
 .DS_Store
 *.log
 
-# Service wallet hex-keys (testnet) — never commit
-.wallets-services.json
-.wallets-services.example.json
+# Internal: deploy config, hackathon notes, dev notes (kept local, not in public repo)
+CLAUDE.md
+Dockerfile
+Dockerfile.*
+cloudbuild*.yaml
+.dockerignore
+.gcloudignore
+HACKATHON_SUBMISSION.md
+RUN_LOG.md
 
-# Canvas / misc large base64 blobs
-cs_aa.b64
+# Internal: ops tooling, early architecture, case studies (kept local)
+/scripts/
+/openrun/
+/infra/
+/docs/
+/archive/
+
+# Internal: state, wallets, runtime artifacts
+.wallets*.json
+.brc-identities.json
+.autonomous-agents.json
+.fleet-*.json
+.bible-*.json
+.classics-*.json
+.wisdom-*.json
+.worktrees/
+.ladder-state/
+.peck-state/
+.agent-wallets/
+.wallet-storage/
+.bible-*/
+.classics-*/
+.cross-ref-*/
+.wisdom-*/
+.peck-*-state/
+.bsv-*-state/
+.smart-*-state/
+.gaps/
+.xref-data/
 cs_*.b64
-
-# Bible/classic/wisdom root registries (txid indexes, but OK to exclude since they change)
-.classics-roots.json
-.wisdom-roots.json
-
-# Claude Code planning artifacts (internal, pre-pivot, some Norwegian)
-.claude/
-
-# Pre-pivot sCrypt contract artifacts (not part of submitted solution)
 artifacts/
-
-# Local-dev fake service account (never commit — private key in JSON)
-infra/fake-sa.json
-infra/fake-sa.key
 __pycache__/
 *.pyc
-.gaps/
 
-__pycache__/
-*.pyc
-.gaps/
+# Scratch
+/probe_*.ts
+/wallet_*.ts
+/check_sig.ts
+/classics-actions.ts

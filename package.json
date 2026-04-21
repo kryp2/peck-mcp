@@ -2,23 +2,19 @@
   "name": "peck-mcp",
   "version": "0.4.0",
   "type": "module",
-  "description": "MCP server giving any LLM a BRC-100 identity, an OS-keychain-resident BSV wallet, and 38 tools for reading + writing the shared Bitcoin Schema social graph (peck.to + 50 other apps). Stdio for local installs (full writes + PeerPay live funding via bitcoin-agent-wallet); StreamableHTTP for hosted read-only demos.",
+  "description": "MCP server giving any LLM a BRC-100 identity, an OS-keychain-resident BSV wallet, and tools for reading + writing the shared Bitcoin Schema social graph (peck.to + 50 other apps). Runs as stdio for local installs or StreamableHTTP for hosted deployments.",
   "bin": {
     "peck-mcp": "./dist/bin.js"
   },
   "files": [
     "dist",
-    "src/mcp",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
-    "build:publish": "tsc -p tsconfig.publish.json",
-    "prepublishOnly": "npm run build:publish",
-    "mcp:remote": "tsx src/mcp/peck-mcp-remote.ts",
-    "mcp:stdio": "MCP_TRANSPORT=stdio tsx src/mcp/peck-mcp-remote.ts",
-    "mcp:local": "tsx src/mcp/peck-mcp.ts"
+    "start": "node dist/bin.js",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -48,24 +44,12 @@
   },
   "dependencies": {
     "@bsv/sdk": "^2.0.13",
-    "@bsv/wallet-toolbox": "^2.1.18",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "bitcoin-agent-wallet": "^0.3.3",
-    "dotenv": "^17.4.1",
-    "eventsource": "^3.0.2",
-    "express": "^4.21.2",
-    "ioredis": "^5.10.1",
-    "knex": "^3.2.9",
-    "pg": "^8.20.0",
-    "scrypt-ts": "^1.4.5",
-    "sqlite3": "^6.0.1",
-    "tsx": "^4.21.0",
-    "zod": "^4.3.6"
+    "dotenv": "^17.4.1"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
     "@types/node": "^22.0.0",
-    "ts-node": "^10.9.2",
     "typescript": "^5.7.0"
   }
 }

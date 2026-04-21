@@ -1,7 +1,0 @@
-python-fasthtml>=0.6.10
-starlette>=0.37
-uvicorn[standard]>=0.27
-
-# peck-ui is installed as editable from the sibling repo during dev:
-#   pip install -e ../../peck-ui
-# For Cloud Run the Dockerfile COPYs peck-ui into the image and pip installs it.

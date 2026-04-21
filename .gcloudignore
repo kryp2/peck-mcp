@@ -1,8 +1,0 @@
-node_modules/
-dist/
-*.key
-.wallets.json
-.worktrees/
-.ladder-state/
-.peck-state/
-.git/
