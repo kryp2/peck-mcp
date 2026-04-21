@@ -14,6 +14,10 @@ Every tool call produces a real transaction on BSV mainnet, visible at
 `peck.to/tx/<txid>` and to 50 other apps on the same chain. No simulation,
 no toy chain.
 
+> **Hackathon submission (Open Run Agentic Pay, April 2026):** the exact
+> commit judged is frozen at [`submission-2026-04-17`](https://github.com/kryp2/peck-mcp/releases/tag/submission-2026-04-17).
+> `master` has evolved since — check out the tag for the submitted state.
+
 ## Install
 
 ```bash
