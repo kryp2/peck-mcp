@@ -24,6 +24,9 @@ import {
 import { randomUUID, randomBytes } from 'crypto'
 import { PrivateKey, PublicKey, Transaction, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv/sdk'
 import { createHash } from 'crypto'
+import { homedir } from 'os'
+import { join } from 'path'
+import { PeckAgentWallet, getOrMigrateIdentityKey } from 'peck-agent-wallet'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -33,6 +36,42 @@ const ARC_URL = NETWORK === 'main' ? 'https://arc.taal.com' : 'https://arc-test.
 const ARC_KEY = process.env.TAAL_API_KEY || ''
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
 const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
+
+// ============================================================================
+// Agent wallet bootstrap — MCP owns its own BRC-100 identity via peck-agent-
+// wallet, loaded from OS keychain (auto-migrated from legacy ~/.peck/identity.json
+// on first run). Every write-tool routes through agentWallet.broadcast() so
+// UTXO-state, ancestor BEEF, signing, and ARC submission are wallet-toolbox's
+// responsibility — MCP never polls UTXOs or hand-rolls P2PKH.
+// ============================================================================
+
+let agentWallet: PeckAgentWallet | null = null
+let agentKey: PrivateKey | null = null   // used by Bitcoin Schema script builders (AIP signing)
+
+async function initAgentWallet(): Promise<void> {
+  try {
+    const privateKeyHex = await getOrMigrateIdentityKey()
+    agentKey = PrivateKey.fromHex(privateKeyHex)
+    agentWallet = new PeckAgentWallet({
+      privateKeyHex,
+      network: NETWORK as 'main' | 'test',
+      appName: APP_NAME,
+      storage: {
+        kind: 'sqlite',
+        filePath: process.env.PECK_MCP_WALLET_DB || join(homedir(), '.peck-mcp-wallet.db'),
+      },
+    })
+    await agentWallet.init()
+    console.error(`[peck-mcp] wallet ready — identityKey=${agentWallet.getIdentityKey().slice(0, 16)}…`)
+  } catch (e: any) {
+    console.error(`[peck-mcp] wallet init failed: ${e?.message || e}`)
+    console.error(`[peck-mcp] write-tools will return "wallet unavailable" until this is resolved.`)
+    agentWallet = null
+    agentKey = null
+  }
+}
+
+await initAgentWallet()
 
 // Bitcoin Schema protocol prefixes
 const PROTO_B = '19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut'
@@ -1267,98 +1306,123 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_unlike_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_txid) {
-          text = JSON.stringify({ error: 'target_txid and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_txid) { text = JSON.stringify({ error: 'target_txid required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unlike',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unlike'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_unfollow_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_paymail) {
-          text = JSON.stringify({ error: 'target_paymail and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_paymail) { text = JSON.stringify({ error: 'target_paymail required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unfollow',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unfollow'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_friend_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_bap_id) {
-          text = JSON.stringify({ error: 'target_bap_id and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const fields: Record<string, string> = { bapID: String(args.target_bap_id) }
           if (args?.target_pubkey) fields.pubKey = String(args.target_pubkey)
-          const script = buildMapOnly('friend', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('friend', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck friend',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'friend'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_unfriend_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_bap_id) {
-          text = JSON.stringify({ error: 'target_bap_id and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
+        if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck unfriend',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'unfriend'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_repost_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.target_txid || !args?.content) {
-          text = JSON.stringify({ error: 'target_txid, content and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        if (!args?.target_txid || !args?.content) {
+          text = JSON.stringify({ error: 'target_txid and content required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildRepost(String(args.content), String(args.target_txid), key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildRepost(String(args.content), String(args.target_txid), agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck repost',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'repost'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_payment_tx': {
-        const signingKey = args?.signing_key
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         const targetTxid = args?.target_txid
         const amountSats = Number(args?.amount_sats)
-        if (!signingKey || !targetTxid || !amountSats || amountSats < 1) {
-          text = JSON.stringify({ error: 'target_txid, amount_sats (>=1) and signing_key required' })
+        if (!targetTxid || !amountSats || amountSats < 1) {
+          text = JSON.stringify({ error: 'target_txid and amount_sats (>=1) required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
 
           // Resolve recipient: explicit address arg wins, otherwise look up
           // the post and use its author. Errors out if neither yields one.
@@ -1378,22 +1442,41 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           // Build the MAP envelope: type=payment + tx=<target>. Indexer
           // sums tx output sats for the amount, but we encode it explicitly
           // so the wire format is self-describing.
-          const script = buildMapOnly(
+          const schemaScript = buildMapOnly(
             'payment',
             { tx: String(targetTxid), value: String(amountSats) },
-            key,
+            agentKey,
             appName,
           )
-          text = await broadcastPayment(script, key, recipientAddr, amountSats, args?.spend_utxo)
+          const paymentLock = new P2PKH().lock(recipientAddr)
+          const result = await agentWallet.broadcast({
+            description: 'peck payment',
+            outputs: [
+              { lockingScript: schemaScript.toHex(), satoshis: 0 },
+              { lockingScript: paymentLock.toHex(), satoshis: amountSats },
+            ],
+            labels: ['peck', 'payment'],
+          })
+          text = JSON.stringify({
+            success: true,
+            txid: result.txid,
+            status: result.status,
+            peck_to: `https://peck.to/tx/${result.txid}`,
+            paid: amountSats,
+            recipient: recipientAddr,
+          })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_message_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey || !args?.content) {
-          text = JSON.stringify({ error: 'content and signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
+        if (!args?.content) {
+          text = JSON.stringify({ error: 'content required' })
           break
         }
         if (args?.channel && args?.recipient) {
@@ -1401,8 +1484,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const opts: { channel?: string; recipient?: string } = {}
           if (args?.channel) opts.channel = String(args.channel)
           if (args?.recipient) opts.recipient = String(args.recipient)
@@ -1420,20 +1502,24 @@ async function handleToolCall(name: string, args: any): Promise<string> {
               ? String(args.recipient_pubkey)
               : await resolveRecipientPubkey(opts.recipient!)
             const recipientPub = PublicKey.fromString(pubHex)
-            content = await encryptForRecipient(content, key, recipientPub)
+            content = await encryptForRecipient(content, agentKey, recipientPub)
           }
 
-          const script = buildMessage(content, opts, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMessage(content, opts, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck message',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'message'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
       case 'peck_profile_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey) {
-          text = JSON.stringify({ error: 'signing_key required' })
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
           break
         }
         // At least one field must be set
@@ -1447,13 +1533,22 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
-          const script = buildMapOnly('profile', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const appName = args?.agent_app || APP_NAME
+          const script = buildMapOnly('profile', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck profile',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'profile'],
+          })
+          const out: Record<string, any> = {
+            success: true,
+            txid: result.txid,
+            status: result.status,
+            peck_to: `https://peck.to/tx/${result.txid}`,
+          }
 
           // Register/update agent identity in identity-services for BRC-42 payments + discovery
-          const pubKeyHex = key.toPublicKey().toString()
+          const pubKeyHex = agentKey.toPublicKey().toString()
           const handle = fields.paymail
             ? fields.paymail.split('@')[0]
             : `agent-${pubKeyHex.slice(0, 16)}`
@@ -1468,24 +1563,18 @@ async function handleToolCall(name: string, args: any): Promise<string> {
                 type: 'agent',
               }),
             })
-            const idResult = await idResp.json()
-            // Merge identity-services result into response
-            const parsed = JSON.parse(text)
-            parsed.identity_registered = idResp.ok
-            parsed.identity_handle = `${handle}@peck.to`
-            if (!idResp.ok) parsed.identity_error = idResult.error
-            text = JSON.stringify(parsed, null, 2)
+            const idResult = await idResp.json() as any
+            out.identity_registered = idResp.ok
+            out.identity_handle = `${handle}@peck.to`
+            if (!idResp.ok) out.identity_error = idResult.error
           } catch (idErr: any) {
             // Non-blocking — profile TX already succeeded on-chain
-            try {
-              const parsed = JSON.parse(text)
-              parsed.identity_registered = false
-              parsed.identity_error = idErr.message
-              text = JSON.stringify(parsed, null, 2)
-            } catch { /* keep original text */ }
+            out.identity_registered = false
+            out.identity_error = idErr.message
           }
+          text = JSON.stringify(out, null, 2)
         } catch (e: any) {
-          text = JSON.stringify({ error: e.message, hint: 'Check signing_key is valid hex and address is funded.' })
+          text = JSON.stringify({ error: e.message, hint: 'Check keychain identity is valid and agent has spendable UTXOs.' })
         }
         break
       }
@@ -1625,46 +1714,63 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
 
-      // ─── WRITE (build + sign + broadcast P2PKH deterministic) ───
+      // ─── WRITE (build Bitcoin Schema script + broadcast via peck-agent-wallet) ───
       case 'peck_post_tx':
       case 'peck_reply_tx':
       case 'peck_like_tx':
       case 'peck_follow_tx': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           let script: Script
+          let description: string
+          let labels: string[]
           if (name === 'peck_post_tx') {
-            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: key, app: appName })
+            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: agentKey, app: appName })
+            description = 'peck post'
+            labels = ['peck', 'post']
           } else if (name === 'peck_reply_tx') {
-            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: key, app: appName })
+            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: agentKey, app: appName })
+            description = 'peck reply'
+            labels = ['peck', 'reply']
           } else if (name === 'peck_like_tx') {
-            script = buildMapOnly('like', { tx: args?.target_txid }, key, appName)
+            script = buildMapOnly('like', { tx: String(args?.target_txid || '') }, agentKey, appName)
+            description = 'peck like'
+            labels = ['peck', 'like']
           } else {
-            script = buildMapOnly('follow', { bapID: args?.target_pubkey }, key, appName)
+            script = buildMapOnly('follow', { bapID: String(args?.target_pubkey || '') }, agentKey, appName)
+            description = 'peck follow'
+            labels = ['peck', 'follow']
           }
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const result = await agentWallet.broadcast({
+            description,
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels,
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
         break
       }
 
-      // ─── TAG (deterministic P2PKH, NO wallet-toolbox) ───
-      // Direct broadcast to ARC. State change only if ARC confirms SEEN_ON_NETWORK.
+      // ─── TAG (Bitcoin Schema retroactive tag, broadcast via peck-agent-wallet) ───
       case 'peck_tag_tx': {
-        const signingKey = args?.signing_key
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         const targetTxid = args?.target_txid
         const tagsIn = args?.tags
-        if (!signingKey || !targetTxid || !Array.isArray(tagsIn) || tagsIn.length === 0) {
-          text = JSON.stringify({ error: 'signing_key, target_txid, tags[] required' })
+        if (!targetTxid || !Array.isArray(tagsIn) || tagsIn.length === 0) {
+          text = JSON.stringify({ error: 'target_txid and tags[] required' })
           break
         }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const app = args?.agent_app || 'peck.agents'
+          const app = args?.agent_app || APP_NAME
           const fields: Record<string, string> = {
             context: 'tx',
             tx: String(targetTxid),
@@ -1673,8 +1779,13 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           if (args?.category) fields.category = String(args.category).toLowerCase()
           if (args?.lang) fields.lang = String(args.lang).toLowerCase()
           if (args?.tone) fields.tone = String(args.tone).toLowerCase()
-          const script = buildMapOnly('tag', fields, key, app)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('tag', fields, agentKey, app)
+          const result = await agentWallet.broadcast({
+            description: 'peck tag',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'tag'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1683,20 +1794,26 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION REGISTER ───
       case 'peck_function_register': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           // Build MAP SET with function fields
           const fields: Record<string, string> = {
-            name: args?.name,
+            name: String(args?.name || ''),
             price: String(args?.price || 0),
-            description: args?.description || '',
+            description: String(args?.description || ''),
           }
-          if (args?.args_schema) fields.argsType = args.args_schema
-          const script = buildMapOnly('function', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          if (args?.args_schema) fields.argsType = String(args.args_schema)
+          const script = buildMapOnly('function', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck function register',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'function', 'register'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
@@ -1705,19 +1822,25 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION CALL ───
       case 'peck_function_call': {
-        const signingKey = args?.signing_key
-        if (!signingKey) { text = JSON.stringify({ error: 'signing_key required' }); break }
+        if (!agentWallet || !agentKey) {
+          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+          break
+        }
         try {
-          const key = PrivateKey.fromHex(signingKey)
-          const appName = args?.agent_app || 'peck.agents'
+          const appName = args?.agent_app || APP_NAME
           const fields: Record<string, string> = {
-            name: args?.name,
-            args: args?.args || '{}',
+            name: String(args?.name || ''),
+            args: String(args?.args || '{}'),
             context: 'bapID',
-            bapID: args?.provider_address,
+            bapID: String(args?.provider_address || ''),
           }
-          const script = buildMapOnly('function', fields, key, appName)
-          text = await broadcastScript(script, key, args?.spend_utxo)
+          const script = buildMapOnly('function', fields, agentKey, appName)
+          const result = await agentWallet.broadcast({
+            description: 'peck function call',
+            outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
+            labels: ['peck', 'function', 'call'],
+          })
+          text = JSON.stringify({ success: true, txid: result.txid, status: result.status, peck_to: `https://peck.to/tx/${result.txid}` })
         } catch (e: any) {
           text = JSON.stringify({ error: e.message })
         }
