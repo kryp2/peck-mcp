@@ -26,7 +26,7 @@ import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet } from '@bsv
 import { createHash } from 'crypto'
 import { homedir } from 'os'
 import { join } from 'path'
-import { BitcoinAgentWallet, getOrMigrateIdentityKey } from 'bitcoin-agent-wallet'
+import { BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts } from 'bitcoin-agent-wallet'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -45,23 +45,62 @@ const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
 // responsibility — MCP never polls UTXOs or hand-rolls P2PKH.
 // ============================================================================
 
+// Multi-identity fleet: each account name (e.g. "default", "scribe-01") maps to
+// a fully-initialised BitcoinAgentWallet. Write-tools accept agent_account, and
+// loadAgent() lazily spins up wallets on first use. `agentWallet` / `agentKey`
+// are kept as back-compat aliases pointing at the default agent so legacy code
+// paths (peck_identity_info, etc.) keep working.
+type LoadedAgent = { wallet: BitcoinAgentWallet; key: PrivateKey }
+const agents = new Map<string, LoadedAgent>()
 let agentWallet: BitcoinAgentWallet | null = null
 let agentKey: PrivateKey | null = null   // used by Bitcoin Schema script builders (AIP signing)
 
+/** Resolve + cache a BitcoinAgentWallet for the given keychain account.
+ *  Returns null if the account has no identity stored. Safe to call from any
+ *  handler — subsequent calls for the same account reuse the cached wallet. */
+async function loadAgent(account: string): Promise<LoadedAgent | null> {
+  const cached = agents.get(account)
+  if (cached) return cached
+  let hex: string | null
+  if (account === 'default') {
+    // Back-compat path: also migrate legacy ~/.peck/identity.json on first run.
+    hex = await getOrMigrateIdentityKey()
+  } else {
+    hex = await loadIdentityKey({ account })
+  }
+  if (!hex) return null
+  const key = PrivateKey.fromHex(hex)
+  const dbSuffix = account === 'default' ? '' : `-${account}`
+  const wallet = new BitcoinAgentWallet({
+    privateKeyHex: hex,
+    network: NETWORK as 'main' | 'test',
+    appName: APP_NAME,
+    storage: {
+      kind: 'sqlite',
+      filePath: process.env.PECK_MCP_WALLET_DB && account === 'default'
+        ? process.env.PECK_MCP_WALLET_DB
+        : join(homedir(), `.peck-mcp-wallet${dbSuffix}.db`),
+    },
+  })
+  await wallet.init()
+  const loaded: LoadedAgent = { wallet, key }
+  agents.set(account, loaded)
+  console.error(`[peck-mcp] wallet ready for '${account}' — identityKey=${wallet.getIdentityKey().slice(0, 16)}…`)
+  return loaded
+}
+
 async function initAgentWallet(): Promise<void> {
   try {
-    const privateKeyHex = await getOrMigrateIdentityKey()
-    agentKey = PrivateKey.fromHex(privateKeyHex)
-    agentWallet = new BitcoinAgentWallet({
-      privateKeyHex,
-      network: NETWORK as 'main' | 'test',
-      appName: APP_NAME,
-      storage: {
-        kind: 'sqlite',
-        filePath: process.env.PECK_MCP_WALLET_DB || join(homedir(), '.peck-mcp-wallet.db'),
-      },
-    })
-    await agentWallet.init()
+    const loaded = await loadAgent('default')
+    if (!loaded) {
+      console.error(`[peck-mcp] no default identity found — call peck_fleet_spawn or migrate ~/.peck/identity.json first.`)
+      agentWallet = null
+      agentKey = null
+      return
+    }
+    // Back-compat: expose default agent through legacy globals.
+    agentWallet = loaded.wallet
+    agentKey = loaded.key
     console.error(`[peck-mcp] wallet ready — identityKey=${agentWallet.getIdentityKey().slice(0, 16)}…`)
 
     // Startup catch-up — pull anything already waiting in payment_inbox
@@ -1178,15 +1217,17 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_unlike_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.target_txid) { text = JSON.stringify({ error: 'target_txid required' }); break }
         try {
           const appName = args?.agent_app || APP_NAME
-          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('unlike', { tx: String(args.target_txid) }, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck unlike',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'unlike'],
@@ -1198,15 +1239,17 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_unfollow_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.target_paymail) { text = JSON.stringify({ error: 'target_paymail required' }); break }
         try {
           const appName = args?.agent_app || APP_NAME
-          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('unfollow', { paymail: String(args.target_paymail) }, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck unfollow',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'unfollow'],
@@ -1218,8 +1261,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_friend_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
@@ -1227,8 +1272,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           const appName = args?.agent_app || APP_NAME
           const fields: Record<string, string> = { bapID: String(args.target_bap_id) }
           if (args?.target_pubkey) fields.pubKey = String(args.target_pubkey)
-          const script = buildMapOnly('friend', fields, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('friend', fields, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck friend',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'friend'],
@@ -1240,15 +1285,17 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_unfriend_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.target_bap_id) { text = JSON.stringify({ error: 'target_bap_id required' }); break }
         try {
           const appName = args?.agent_app || APP_NAME
-          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('unfriend', { bapID: String(args.target_bap_id) }, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck unfriend',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'unfriend'],
@@ -1260,8 +1307,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_repost_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.target_txid || !args?.content) {
@@ -1270,8 +1319,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         }
         try {
           const appName = args?.agent_app || APP_NAME
-          const script = buildRepost(String(args.content), String(args.target_txid), agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildRepost(String(args.content), String(args.target_txid), agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck repost',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'repost'],
@@ -1283,8 +1332,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_payment_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         const targetTxid = args?.target_txid
@@ -1317,11 +1368,11 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           const schemaScript = buildMapOnly(
             'payment',
             { tx: String(targetTxid), value: String(amountSats) },
-            agentKey,
+            agent.key,
             appName,
           )
           const paymentLock = new P2PKH().lock(recipientAddr)
-          const result = await agentWallet.broadcast({
+          const result = await agent.wallet.broadcast({
             description: 'peck payment',
             outputs: [
               { lockingScript: schemaScript.toHex(), satoshis: 0 },
@@ -1343,8 +1394,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_message_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         if (!args?.content) {
@@ -1374,11 +1427,11 @@ async function handleToolCall(name: string, args: any): Promise<string> {
               ? String(args.recipient_pubkey)
               : await resolveRecipientPubkey(opts.recipient!)
             const recipientPub = PublicKey.fromString(pubHex)
-            content = await encryptForRecipient(content, agentKey, recipientPub)
+            content = await encryptForRecipient(content, agent.key, recipientPub)
           }
 
-          const script = buildMessage(content, opts, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMessage(content, opts, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck message',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'message'],
@@ -1390,8 +1443,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_profile_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         // At least one field must be set
@@ -1406,8 +1461,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         }
         try {
           const appName = args?.agent_app || APP_NAME
-          const script = buildMapOnly('profile', fields, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('profile', fields, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck profile',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'profile'],
@@ -1420,7 +1475,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           }
 
           // Register/update agent identity in identity-services for BRC-42 payments + discovery
-          const pubKeyHex = agentKey.toPublicKey().toString()
+          const pubKeyHex = agent.key.toPublicKey().toString()
           const handle = fields.paymail
             ? fields.paymail.split('@')[0]
             : `agent-${pubKeyHex.slice(0, 16)}`
@@ -1594,8 +1649,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       case 'peck_reply_tx':
       case 'peck_like_tx':
       case 'peck_follow_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         try {
@@ -1604,23 +1661,23 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           let description: string
           let labels: string[]
           if (name === 'peck_post_tx') {
-            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: agentKey, app: appName })
+            script = buildPost(args?.content || '', { tags: args?.tags, channel: args?.channel, signingKey: agent.key, app: appName })
             description = 'peck post'
             labels = ['peck', 'post']
           } else if (name === 'peck_reply_tx') {
-            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: agentKey, app: appName })
+            script = buildPost(args?.content || '', { parentTxid: args?.parent_txid, tags: args?.tags, signingKey: agent.key, app: appName })
             description = 'peck reply'
             labels = ['peck', 'reply']
           } else if (name === 'peck_like_tx') {
-            script = buildMapOnly('like', { tx: String(args?.target_txid || '') }, agentKey, appName)
+            script = buildMapOnly('like', { tx: String(args?.target_txid || '') }, agent.key, appName)
             description = 'peck like'
             labels = ['peck', 'like']
           } else {
-            script = buildMapOnly('follow', { bapID: String(args?.target_pubkey || '') }, agentKey, appName)
+            script = buildMapOnly('follow', { bapID: String(args?.target_pubkey || '') }, agent.key, appName)
             description = 'peck follow'
             labels = ['peck', 'follow']
           }
-          const result = await agentWallet.broadcast({
+          const result = await agent.wallet.broadcast({
             description,
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels,
@@ -1634,8 +1691,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── TAG (Bitcoin Schema retroactive tag, broadcast via bitcoin-agent-wallet) ───
       case 'peck_tag_tx': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         const targetTxid = args?.target_txid
@@ -1654,8 +1713,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           if (args?.category) fields.category = String(args.category).toLowerCase()
           if (args?.lang) fields.lang = String(args.lang).toLowerCase()
           if (args?.tone) fields.tone = String(args.tone).toLowerCase()
-          const script = buildMapOnly('tag', fields, agentKey, app)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('tag', fields, agent.key, app)
+          const result = await agent.wallet.broadcast({
             description: 'peck tag',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'tag'],
@@ -1669,8 +1728,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION REGISTER ───
       case 'peck_function_register': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         try {
@@ -1682,8 +1743,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             description: String(args?.description || ''),
           }
           if (args?.args_schema) fields.argsType = String(args.args_schema)
-          const script = buildMapOnly('function', fields, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('function', fields, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck function register',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'function', 'register'],
@@ -1697,8 +1758,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── REQUEST PAYMENT (PeerPay standard) ───
       case 'peck_request_payment': {
-        if (!agentWallet) {
-          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         try {
@@ -1718,7 +1781,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             break
           }
           const expiresAtMs = args?.expires_at_ms ? Number(args.expires_at_ms) : Date.now() + 3600_000
-          const res = await agentWallet.requestPayment({
+          const res = await agent.wallet.requestPayment({
             recipientIdentityKey: recipient,
             sats,
             description,
@@ -1742,8 +1805,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── SEND PAYMENT (push via PeerPay live WS) ───
       case 'peck_send_payment': {
-        if (!agentWallet) {
-          text = JSON.stringify({ error: 'wallet unavailable — install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         try {
@@ -1757,7 +1822,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             text = JSON.stringify({ error: 'sats must be >= 1' })
             break
           }
-          await agentWallet.sendLivePayment({ recipientIdentityKey: recipient, sats })
+          await agent.wallet.sendLivePayment({ recipientIdentityKey: recipient, sats })
           text = JSON.stringify({
             success: true,
             recipient_identity_key: recipient,
@@ -1773,8 +1838,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
       // ─── FUNCTION CALL ───
       case 'peck_function_call': {
-        if (!agentWallet || !agentKey) {
-          text = JSON.stringify({ error: 'wallet unavailable — this MCP deployment has no identity configured. Install peck-mcp locally with keychain for writes.' })
+        const account = String(args?.agent_account || 'default')
+        const agent = await loadAgent(account)
+        if (!agent) {
+          text = JSON.stringify({ error: `wallet unavailable for account '${account}'. Call peck_fleet_spawn({account: '${account}'}) to create it, or install peck-mcp locally with keychain for writes.` })
           break
         }
         try {
@@ -1785,8 +1852,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             context: 'bapID',
             bapID: String(args?.provider_address || ''),
           }
-          const script = buildMapOnly('function', fields, agentKey, appName)
-          const result = await agentWallet.broadcast({
+          const script = buildMapOnly('function', fields, agent.key, appName)
+          const result = await agent.wallet.broadcast({
             description: 'peck function call',
             outputs: [{ lockingScript: script.toHex(), satoshis: 0 }],
             labels: ['peck', 'function', 'call'],
