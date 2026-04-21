@@ -723,7 +723,7 @@ function buildPost(content: string, opts: {
   // AIP
   // BSM and createHash imported at top level
   const addr = opts.signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), opts.signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), opts.signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -755,7 +755,7 @@ function buildRepost(content: string, targetTxid: string, signingKey: PrivateKey
     pushData(s, 'tx'); pushData(s, targetTxid)
   }
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content || targetTxid).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content || targetTxid).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -887,7 +887,7 @@ function buildMessage(
     pushData(s, 'bapID'); pushData(s, opts.recipient)
   }
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }
@@ -903,7 +903,7 @@ function buildMapOnly(type: string, fields: Record<string, string>, signingKey: 
   // AIP
   // BSM and createHash imported at top level
   const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey)
+  const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey) as unknown as string
   s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
   return s
 }

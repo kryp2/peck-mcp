@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src"
+  },
+  "include": [
+    "src/bin.ts",
+    "src/mcp/peck-mcp-remote.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/agents",
+    "src/v2",
+    "src/ladder",
+    "src/clients",
+    "src/mcp/peck-mcp.ts",
+    "src/utxo-manager.ts",
+    "src/bitcoin-sig.ts",
+    "src/peck-mcp.ts"
+  ]
+}

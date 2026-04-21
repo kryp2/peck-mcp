@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run build",
+    "build:publish": "tsc -p tsconfig.publish.json",
+    "prepublishOnly": "npm run build:publish",
     "mcp:remote": "tsx src/mcp/peck-mcp-remote.ts",
     "mcp:stdio": "MCP_TRANSPORT=stdio tsx src/mcp/peck-mcp-remote.ts",
     "mcp:local": "tsx src/mcp/peck-mcp.ts"
