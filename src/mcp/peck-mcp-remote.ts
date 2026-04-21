@@ -811,6 +811,56 @@ const TOOLS = [
     },
   },
 
+  // ─── FLEET management (multi-identity agent roster) ───
+  // Each "account" is a separate BRC-100 identity stored in the OS keychain
+  // (service: peck-agent, account: <name>). Fleet tools let a caller list
+  // available identities, spawn new ones, and inspect on-chain state for each.
+  // Write-tools accept an optional agent_account arg that routes the call to
+  // the matching identity — see peck_fleet_spawn for how to bootstrap.
+  {
+    name: 'peck_fleet_list',
+    description:
+      'List all BRC-100 identities stored in the OS keychain for this install. ' +
+      'Each entry reports the account name, BSV address, identity pubkey, whether ' +
+      'the wallet is currently loaded in-memory, and whether the entry is the default. ' +
+      'Use to discover which agents you can write as via the agent_account parameter.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+    },
+  },
+  {
+    name: 'peck_fleet_spawn',
+    description:
+      'Spawn a new BRC-100 identity and persist it in the OS keychain under the given ' +
+      'account name. Generates a random PrivateKey locally — the key never leaves the host. ' +
+      'Fails if the account already exists or the name is "default" (reserved for legacy ' +
+      'migration). After spawn, fund the returned address via peck_send_payment from the ' +
+      'default agent (or any BRC-29-capable wallet) before writing.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        account: { type: 'string', description: 'Lowercase 3-32 chars a-z 0-9 _ - (e.g. "scribe-01", "treasurer", "oracle").' },
+      },
+      required: ['account'],
+    },
+  },
+  {
+    name: 'peck_fleet_info',
+    description:
+      'Detailed info for a single fleet identity: keychain account, address, identity pubkey, ' +
+      'load-status (has a wallet been spun up yet?), default flag, and on-chain WhatsOnChain ' +
+      'balance. Use before writing with agent_account so you can sanity-check the agent is ' +
+      'funded and ready.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        account: { type: 'string', description: 'Account name from peck_fleet_list.' },
+      },
+      required: ['account'],
+    },
+  },
+
 ]
 
 // ============================================================================
@@ -1887,6 +1937,108 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             map_content: c.map_content,
           })),
         }, null, 2)
+        break
+      }
+
+      // ─── FLEET (multi-identity roster management) ───
+      case 'peck_fleet_list': {
+        try {
+          const accounts = await listIdentityAccounts()
+          const info: any[] = []
+          for (const acc of accounts) {
+            const hex = await loadIdentityKey({ account: acc })
+            if (!hex) continue
+            const key = PrivateKey.fromHex(hex)
+            info.push({
+              account: acc,
+              address: key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string,
+              identity_key: key.toPublicKey().toString(),
+              loaded: agents.has(acc),
+              is_default: acc === 'default',
+            })
+          }
+          text = JSON.stringify({ count: info.length, accounts: info }, null, 2)
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      case 'peck_fleet_spawn': {
+        const account = String(args?.account || '').toLowerCase()
+        if (!/^[a-z0-9_-]{3,32}$/.test(account)) {
+          text = JSON.stringify({ error: 'account must be 3-32 chars a-z 0-9 _ -' })
+          break
+        }
+        if (account === 'default') {
+          text = JSON.stringify({ error: "'default' is reserved — it auto-loads from legacy ~/.peck/identity.json on first run." })
+          break
+        }
+        try {
+          const existing = await loadIdentityKey({ account })
+          if (existing) {
+            text = JSON.stringify({ error: `account '${account}' already exists in keychain` })
+            break
+          }
+          const key = PrivateKey.fromRandom()
+          await storeIdentityKey(key.toHex(), { account })
+          const address = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
+          const identityKey = key.toPublicKey().toString()
+          text = JSON.stringify({
+            success: true,
+            account,
+            address,
+            identity_key: identityKey,
+            next: `Fund this agent by calling peck_send_payment({ recipient_identity_key: '${identityKey}', sats: 5000 }). Then write as this agent with agent_account: '${account}' parameter.`,
+          }, null, 2)
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
+        break
+      }
+
+      case 'peck_fleet_info': {
+        const account = String(args?.account || '').toLowerCase()
+        if (!account) {
+          text = JSON.stringify({ error: 'account required' })
+          break
+        }
+        try {
+          const hex = await loadIdentityKey({ account })
+          if (!hex) {
+            text = JSON.stringify({ error: `no identity for '${account}' — call peck_fleet_spawn first` })
+            break
+          }
+          const key = PrivateKey.fromHex(hex)
+          const address = key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
+          // On-chain balance via WoC — manual fleet inspection is one of the allowed
+          // non-hot-path WoC uses. Not called from any scheduled loop.
+          let confirmed = 0
+          let unconfirmed = 0
+          try {
+            const net = NETWORK === 'main' ? 'main' : 'test'
+            const r = await fetch(`https://api.whatsonchain.com/v1/bsv/${net}/address/${address}/balance`)
+            const b = await r.json() as any
+            confirmed = b.confirmed || 0
+            unconfirmed = b.unconfirmed || 0
+          } catch { /* best-effort — still return identity info */ }
+          text = JSON.stringify({
+            account,
+            address,
+            identity_key: key.toPublicKey().toString(),
+            loaded: agents.has(account),
+            is_default: account === 'default',
+            balance: {
+              confirmed,
+              unconfirmed,
+              total_sat: confirmed + unconfirmed,
+              total_bsv: (confirmed + unconfirmed) / 100000000,
+            },
+            usage: `Write as this agent by passing agent_account: '${account}' to any write-tool.`,
+          }, null, 2)
+        } catch (e: any) {
+          text = JSON.stringify({ error: e.message })
+        }
         break
       }
 
