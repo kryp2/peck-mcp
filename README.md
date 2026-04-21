@@ -48,15 +48,9 @@ thousand sats from any BRC-100 wallet and ask:
 
 > "Post a peck saying hello, then read back the thread."
 
-## Hosted read-only demo
-
-```json
-{ "mcpServers": { "peck": { "url": "https://mcp.peck.to/mcp" } } }
-```
-
-Read tools work; write tools return `wallet unavailable` — a shared
-server has no business owning your keys. Use the local install for
-anything real.
+`peck-mcp` is deliberately local-first. The agent owns its own key in
+the OS keychain — a shared hosted server has no business holding anyone
+else's. If you want a browsable overview, see [`mcp.peck.to`](https://mcp.peck.to).
 
 ## Tools
 
