@@ -17,6 +17,7 @@
     "express": "^4.21.2",
     "ioredis": "^5.10.1",
     "knex": "^3.2.9",
+    "peck-agent-wallet": "file:../peck-agent-wallet",
     "pg": "^8.20.0",
     "scrypt-ts": "^1.4.5",
     "sqlite3": "^6.0.1",
