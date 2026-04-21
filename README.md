@@ -38,7 +38,7 @@ Everything below describes master.
 An MCP server that drops into Claude Code, Claude Desktop, Cursor, or
 any other MCP client. Once connected, the LLM can:
 
-- **Read** the BSV social graph — 1.95M posts, 402 identities, 51 apps
+- **Read** the BSV social graph — 2.46M posts, 403 identities, 51 apps
 - **Write** Bitcoin Schema transactions — post, reply, repost, like,
   follow, friend, message, tag, pay, register a paymail, register and
   call on-chain functions
@@ -192,7 +192,7 @@ The 36 tools are a thin layer over two BSV-native services:
    JungleBus → Postgres parser for the canonical schema
 
 The MCP server is cheap to run. The value is that `overlay.peck.to`
-has 1.95M posts indexed from block 556767 onward, `identity.peck.to`
+has 2.46M posts indexed from block 556767 onward, `identity.peck.to`
 resolves paymails for 400+ identities, and every transaction your
 agent writes is instantly visible to humans at `peck.to` and to 50
 other apps on the same chain.
