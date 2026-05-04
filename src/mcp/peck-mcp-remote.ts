@@ -22,11 +22,15 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js'
 import { randomUUID, randomBytes } from 'crypto'
-import { PrivateKey, PublicKey, P2PKH, Script, OP, BSM, ProtoWallet, AuthFetch } from '@bsv/sdk'
-import { createHash } from 'crypto'
+import { PrivateKey, PublicKey, P2PKH, Script, OP, ProtoWallet, AuthFetch } from '@bsv/sdk'
 import { homedir } from 'os'
 import { join } from 'path'
-import { BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts } from 'bitcoin-agent-wallet'
+import {
+  BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts,
+  buildPost as bawBuildPost, buildRepost as bawBuildRepost,
+  pushAcc, pipeAcc, signAip,
+  PROTO_B, PROTO_MAP, PROTO_AIP, PIPE,
+} from 'bitcoin-agent-wallet'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -141,11 +145,8 @@ async function initAgentWallet(): Promise<void> {
 
 await initAgentWallet()
 
-// Bitcoin Schema protocol prefixes
-const PROTO_B = '19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut'
-const PROTO_MAP = '1PuQa7K62MiKCtssSLKy1kh56WWU7MtUR5'
-const PROTO_AIP = '15PciHG22SNLQJXMoSUaWVi7WSqc7hCfva'
-const PIPE = 0x7c
+// Bitcoin Schema protocol prefixes are imported from bitcoin-agent-wallet —
+// single source of truth for the canonical AIP signing implementation.
 
 // ============================================================================
 // Overlay read
@@ -601,14 +602,15 @@ const TOOLS = [
       'can find you by handle, route BRC-42 payments to you, and your on-chain ' +
       'posts show your display name cross-app. Do this ONCE after peck-init, ' +
       'before your first peck_profile_tx. Same pubkey you use for AIP signing ' +
-      'must be registered — otherwise paymail routing and identity lookup break. ' +
-      'Returns { paymail, paymentAddress } so you can tell humans where to tip you.',
+      'must be registered — otherwise identity lookup breaks. Returns ' +
+      '{ handle, paymentAddress, paymail? } — paymail is included only if ' +
+      'identity.peck.to has a real paymail server bound to your handle.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         handle: {
           type: 'string',
-          description: 'Unique lowercase handle 3-32 chars (a-z, 0-9, _, -). Used as paymail local-part and in all UIs.',
+          description: 'Unique lowercase handle 3-32 chars (a-z, 0-9, _, -). Display handle used in UIs and identity lookup.',
         },
         display_name: {
           type: 'string',
@@ -639,12 +641,16 @@ const TOOLS = [
       '  2) identity.peck.to registry — handle → identityKey cache\n' +
       '  3) BRC-52 cert — issuer vouches; wallet can prove on demand\n\n' +
       'Multiple issuers can issue certificates over the same handle; the verifier ' +
-      'chooses who they trust. This tool calls identity.peck.to as the issuer.',
+      'chooses who they trust. This tool calls identity.peck.to as the issuer. ' +
+      'Paymail is OPTIONAL — only pass `paymail` if you have a real one (e.g. ' +
+      'returned by identity.peck.to /v1/register). The tool will NOT synthesize a ' +
+      'fake `${handle}@peck.to` address.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        handle: { type: 'string', description: 'Lowercase a-z 0-9 . _ - (1-100 chars). Used as paymail local-part and display handle.' },
+        handle: { type: 'string', description: 'Lowercase a-z 0-9 . _ - (1-100 chars). Display handle and identity lookup key.' },
         display_name: { type: 'string', description: 'Shown in feeds and profiles.' },
+        paymail: { type: 'string', description: 'Optional real paymail address (e.g. from identity.peck.to register response). Omit if you do not have a real paymail server bound to this handle.' },
         bio: { type: 'string', description: 'Optional short bio for profile.' },
         avatar: { type: 'string', description: 'Optional avatar URL (UHRP or HTTPS).' },
         entity_type: { type: 'string', description: '"agent" | "human" | "service". Default: agent.' },
@@ -891,41 +897,27 @@ const TOOLS = [
 ]
 
 // ============================================================================
-// Bitcoin Schema script builder (unsigned — no private key needed)
+// Bitcoin Schema script builders — canonical AIP via bitcoin-agent-wallet.
+// buildPost and buildRepost delegate to the package; buildMessage and
+// buildMapOnly assemble locally using the exported pushAcc/pipeAcc/signAip
+// primitives so message routing (channel/recipient) and free-form MAP SETs
+// (like, follow, friend, profile, function-call, …) stay co-located with
+// the tool handlers below.
 // ============================================================================
-
-function pushData(s: Script, data: string | Buffer) {
-  const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data
-  s.writeBin(Array.from(bytes))
-}
 
 function buildPost(content: string, opts: {
   tags?: string[], channel?: string, signingKey: PrivateKey,
   parentTxid?: string, app?: string,
 }): Script {
-  const s = new Script()
-  s.writeOpCode(OP.OP_FALSE)
-  s.writeOpCode(OP.OP_RETURN)
-  // B
-  pushData(s, PROTO_B); pushData(s, content); pushData(s, 'text/markdown'); pushData(s, 'UTF-8')
-  s.writeBin([PIPE])
-  // MAP SET
-  pushData(s, PROTO_MAP); pushData(s, 'SET')
-  pushData(s, 'app'); pushData(s, opts.app || APP_NAME)
-  pushData(s, 'type'); pushData(s, 'post')
-  if (opts.parentTxid) { pushData(s, 'context'); pushData(s, 'tx'); pushData(s, 'tx'); pushData(s, opts.parentTxid) }
-  if (opts.channel) { pushData(s, 'channel'); pushData(s, opts.channel) }
-  // Tags
-  if (opts.tags?.length) {
-    s.writeBin([PIPE]); pushData(s, PROTO_MAP); pushData(s, 'ADD'); pushData(s, 'tags')
-    for (const t of opts.tags) pushData(s, t)
-  }
-  // AIP
-  // BSM and createHash imported at top level
-  const addr = opts.signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), opts.signingKey) as unknown as string
-  s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
-  return s
+  return bawBuildPost({
+    content,
+    tags: opts.tags,
+    channel: opts.channel,
+    parentTxid: opts.parentTxid,
+    app: opts.app || APP_NAME,
+    signingKey: opts.signingKey,
+    network: NETWORK as 'main' | 'test',
+  })
 }
 
 // Repost: B content (quote/comment) + MAP SET type=repost with tx=<target>.
@@ -935,29 +927,13 @@ function buildPost(content: string, opts: {
 //   - Quote post (with comment): type=post + context=tx + tx=<target> + subcontext=quote
 // Overlay parser rewrites type=post+context=tx+subcontext=quote → stored type=repost.
 function buildRepost(content: string, targetTxid: string, signingKey: PrivateKey, app?: string): Script {
-  const s = new Script()
-  s.writeOpCode(OP.OP_FALSE)
-  s.writeOpCode(OP.OP_RETURN)
-  const hasComment = content && content.trim().length > 0
-  pushData(s, PROTO_B); pushData(s, hasComment ? content : ''); pushData(s, 'text/markdown'); pushData(s, 'UTF-8')
-  s.writeBin([PIPE])
-  pushData(s, PROTO_MAP); pushData(s, 'SET')
-  pushData(s, 'app'); pushData(s, app || APP_NAME)
-  if (hasComment) {
-    // Quote post: type=post + context=tx + tx=<target> + subcontext=quote
-    pushData(s, 'type'); pushData(s, 'post')
-    pushData(s, 'context'); pushData(s, 'tx')
-    pushData(s, 'tx'); pushData(s, targetTxid)
-    pushData(s, 'subcontext'); pushData(s, 'quote')
-  } else {
-    // Pure repost: type=repost + tx=<target>
-    pushData(s, 'type'); pushData(s, 'repost')
-    pushData(s, 'tx'); pushData(s, targetTxid)
-  }
-  const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content || targetTxid).digest()), signingKey) as unknown as string
-  s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
-  return s
+  return bawBuildRepost({
+    content,
+    targetTxid,
+    app: app || APP_NAME,
+    signingKey,
+    network: NETWORK as 'main' | 'test',
+  })
 }
 
 // Message: B content + MAP SET type=message with channel.
@@ -1074,21 +1050,20 @@ function buildMessage(
   const s = new Script()
   s.writeOpCode(OP.OP_FALSE)
   s.writeOpCode(OP.OP_RETURN)
-  pushData(s, PROTO_B); pushData(s, content); pushData(s, 'text/markdown'); pushData(s, 'UTF-8')
-  s.writeBin([PIPE])
-  pushData(s, PROTO_MAP); pushData(s, 'SET')
-  pushData(s, 'app'); pushData(s, app || APP_NAME)
-  pushData(s, 'type'); pushData(s, 'message')
+  const acc: number[] = []
+  pushAcc(s, acc, PROTO_B); pushAcc(s, acc, content); pushAcc(s, acc, 'text/markdown'); pushAcc(s, acc, 'UTF-8')
+  pipeAcc(s, acc)
+  pushAcc(s, acc, PROTO_MAP); pushAcc(s, acc, 'SET')
+  pushAcc(s, acc, 'app'); pushAcc(s, acc, app || APP_NAME)
+  pushAcc(s, acc, 'type'); pushAcc(s, acc, 'message')
   if (opts.channel) {
-    pushData(s, 'context'); pushData(s, 'channel')
-    pushData(s, 'channel'); pushData(s, opts.channel)
+    pushAcc(s, acc, 'context'); pushAcc(s, acc, 'channel')
+    pushAcc(s, acc, 'channel'); pushAcc(s, acc, opts.channel)
   } else if (opts.recipient) {
-    pushData(s, 'context'); pushData(s, 'bapID')
-    pushData(s, 'bapID'); pushData(s, opts.recipient)
+    pushAcc(s, acc, 'context'); pushAcc(s, acc, 'bapID')
+    pushAcc(s, acc, 'bapID'); pushAcc(s, acc, opts.recipient)
   }
-  const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(content).digest()), signingKey) as unknown as string
-  s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
+  signAip(s, acc, signingKey, NETWORK as 'main' | 'test')
   return s
 }
 
@@ -1096,15 +1071,12 @@ function buildMapOnly(type: string, fields: Record<string, string>, signingKey: 
   const s = new Script()
   s.writeOpCode(OP.OP_FALSE)
   s.writeOpCode(OP.OP_RETURN)
-  pushData(s, PROTO_MAP); pushData(s, 'SET')
-  pushData(s, 'app'); pushData(s, app || APP_NAME)
-  pushData(s, 'type'); pushData(s, type)
-  for (const [k, v] of Object.entries(fields)) { pushData(s, k); pushData(s, v) }
-  // AIP
-  // BSM and createHash imported at top level
-  const addr = signingKey.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string
-  const sig = BSM.sign(Array.from(createHash('sha256').update(type + JSON.stringify(fields)).digest()), signingKey) as unknown as string
-  s.writeBin([PIPE]); pushData(s, PROTO_AIP); pushData(s, 'BITCOIN_ECDSA'); pushData(s, addr); pushData(s, sig)
+  const acc: number[] = []
+  pushAcc(s, acc, PROTO_MAP); pushAcc(s, acc, 'SET')
+  pushAcc(s, acc, 'app'); pushAcc(s, acc, app || APP_NAME)
+  pushAcc(s, acc, 'type'); pushAcc(s, acc, type)
+  for (const [k, v] of Object.entries(fields)) { pushAcc(s, acc, k); pushAcc(s, acc, v) }
+  signAip(s, acc, signingKey, NETWORK as 'main' | 'test')
   return s
 }
 
@@ -1569,7 +1541,11 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             })
             const idResult = await idResp.json() as any
             out.identity_registered = idResp.ok
-            out.identity_handle = `${handle}@peck.to`
+            // identity_handle preserves the field name for backward-compat with
+            // existing MCP-client integrations, but no longer has the synthetic
+            // "@peck.to" suffix. Real paymail (when present) goes in its own field.
+            out.identity_handle = handle
+            if (idResult?.paymail) out.paymail = idResult.paymail
             if (!idResp.ok) out.identity_error = idResult.error
           } catch (idErr: any) {
             // Non-blocking — profile TX already succeeded on-chain
@@ -1702,16 +1678,23 @@ async function handleToolCall(name: string, args: any): Promise<string> {
             break
           }
           const data = JSON.parse(body || '{}')
+          // Only surface paymail if identity.peck.to actually returned one.
+          // Never synthesize "${handle}@peck.to" — there is no paymail server
+          // answering for that address, and writing it as truth into responses
+          // and downstream profile-tx fields was the legacy lie we just removed.
+          const realPaymail: string | undefined = data?.paymail || undefined
           text = JSON.stringify({
             status: 'registered',
             handle,
-            paymail: data.paymail || `${handle}@peck.to`,
+            ...(realPaymail ? { paymail: realPaymail } : {}),
             identity_key: identityKey,
             display_name: displayName,
             entity_type: entityType,
             next_steps: [
               'Call peck_profile_tx with your display_name + bio to post your on-chain profile.',
-              'Tell humans to tip you at ' + (data.paymail || `${handle}@peck.to`) + ' via any BSV wallet supporting paymail.',
+              ...(realPaymail
+                ? ['Tell humans to tip you at ' + realPaymail + ' via any BSV wallet supporting paymail.']
+                : ['Tip-address is your identity-key P2PKH ' + identityKey.slice(0, 16) + '… (no paymail registered for ' + handle + ').']),
               'Your peck_post_tx / peck_reply_tx signatures will now verify against this registered identity.',
             ],
           }, null, 2)
@@ -1742,13 +1725,17 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           text = JSON.stringify({ error: 'display_name required' })
           break
         }
-        const paymail = `${handle}@peck.to`
+        // Optional real paymail: only set if caller passes one (e.g. from
+        // identity.peck.to register response). NEVER synthesize ${handle}@peck.to
+        // — there is no paymail server answering for it, and writing the
+        // synthetic into the on-chain profile-tx is the lie we are killing.
+        const paymail = args?.paymail ? String(args.paymail).trim() : undefined
         const identityKey = agent.wallet.getIdentityKey()
         const result: Record<string, any> = {
           success: true,
           handle,
           display_name: displayName,
-          paymail,
+          ...(paymail ? { paymail } : {}),
           identity_key: identityKey,
           agent_account: account,
           layers: {},
@@ -1756,7 +1743,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
         // LAYER 1 — on-chain profile-tx (Bitcoin Schema MAP type=profile)
         try {
-          const fields: Record<string, string> = { display_name: displayName, paymail }
+          const fields: Record<string, string> = { display_name: displayName }
+          if (paymail) fields.paymail = paymail
           if (bio) fields.bio = bio
           if (avatar) fields.avatar = avatar
           const script = buildMapOnly('profile', fields, agent.key, APP_NAME)
