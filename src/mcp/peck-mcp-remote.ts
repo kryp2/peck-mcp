@@ -31,6 +31,7 @@ import {
   pushAcc, pipeAcc, signAip,
   PROTO_B, PROTO_MAP, PROTO_AIP, PIPE,
 } from 'bitcoin-agent-wallet'
+import { buildMapScript } from '../schema-builders.js'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -1077,16 +1078,7 @@ function buildMessage(
 }
 
 function buildMapOnly(type: string, fields: Record<string, string>, signingKey: PrivateKey, app?: string): Script {
-  const s = new Script()
-  s.writeOpCode(OP.OP_FALSE)
-  s.writeOpCode(OP.OP_RETURN)
-  const acc: number[] = []
-  pushAcc(s, acc, PROTO_MAP); pushAcc(s, acc, 'SET')
-  pushAcc(s, acc, 'app'); pushAcc(s, acc, app || APP_NAME)
-  pushAcc(s, acc, 'type'); pushAcc(s, acc, type)
-  for (const [k, v] of Object.entries(fields)) { pushAcc(s, acc, k); pushAcc(s, acc, v) }
-  signAip(s, acc, signingKey, NETWORK as 'main' | 'test')
-  return s
+  return buildMapScript(type, fields, signingKey, app || APP_NAME, NETWORK as 'main' | 'test')
 }
 
 // ============================================================================
