@@ -36,8 +36,6 @@ const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
 const OVERLAY_URL = process.env.PECK_READER_URL || 'https://overlay.peck.to'
 const IDENTITY_URL = process.env.IDENTITY_URL || 'https://identity.peck.to'
-const ARC_URL = NETWORK === 'main' ? 'https://arc.taal.com' : 'https://arc-test.taal.com'
-const ARC_KEY = process.env.TAAL_API_KEY || ''
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
 const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
 
@@ -47,6 +45,17 @@ const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
 // on first run). Every write-tool routes through agentWallet.broadcast() so
 // UTXO-state, ancestor BEEF, signing, and ARC submission are wallet-toolbox's
 // responsibility — MCP never polls UTXOs or hand-rolls P2PKH.
+//
+// Zero-conf chained writes just work: wallet-toolbox submits each tx as a full
+// BEEF (postBeef → ARC /v1/tx), so an unconfirmed parent travels inside the
+// child's BEEF and ARC never returns 460 "parent not found". No EF/toHexEF step
+// is needed here — BEEF carries the whole parent tx, not just its prevout. (The
+// old hand-rolled rawtx path that hit 460 is gone.)
+//
+// bitcoin-agent-wallet >= 0.5.3 additionally surfaces result.beef (the atomic
+// BEEF) on the synchronous broadcast path — a self-verifying proof a caller can
+// hand to an overlay/peer without an indexer lookup. Write-tools currently
+// return { txid, status } only; result.beef is there when a caller wants it.
 // ============================================================================
 
 // Multi-identity fleet: each account name (e.g. "default", "scribe-01") maps to
