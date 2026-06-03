@@ -139,7 +139,7 @@ WebSocket.
   │  │  └─ wallet.broadcast() primitive              │  │
   │  └───────────────────────────────────────────────┘  │
   │                                                     │
-  │  - 38 tools; writes sign via keychain-resident key  │
+  │  - 42 tools; writes sign via keychain-resident key  │
   │  - Live WS listener auto-internalizes BRC-29        │
   └────┬──────────────────────────────┬─────────────────┘
        │ reads                        │ ARC broadcast
