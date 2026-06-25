@@ -38,6 +38,11 @@ const NETWORK = process.env.PECK_NETWORK || 'main'
 const OVERLAY_URL = process.env.PECK_READER_URL || 'https://overlay.peck.to'
 const IDENTITY_URL = process.env.IDENTITY_URL || 'https://identity.peck.to'
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
+// Block headers (Chaintracks). Primary = the fleet's self-hosted
+// headers.peck.to (chaintracks-server); ARCADE_URL is kept only as a
+// third-party fallback for the rare case headers.peck.to is unreachable.
+// See chaintracksGet() below.
+const HEADERS_URL = process.env.HEADERS_URL || 'https://headers.peck.to'
 const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
 
 // ============================================================================
@@ -173,6 +178,33 @@ async function arcadeGet(path: string): Promise<any> {
   return r.json()
 }
 
+// Block-header reads, served by the fleet's self-hosted Chaintracks
+// (headers.peck.to / chaintracks-server) instead of third-party
+// arcade.gorillapool.io. headers.peck.to mounts the same v2 route shape
+// at /v2 (not /chaintracks/v2) and wraps every response in the chaintracks
+// envelope {status:'success'|'error', value}. We unwrap `.value` so callers
+// keep getting the bare BlockHeader object they got from arcade — the
+// header carries {version, previousHash, merkleRoot, time, bits, nonce,
+// height, hash}, which is a superset of what arcade returned, so no field
+// is lost. The `v2Path` is the headers.peck.to path; `arcadePath` is the
+// equivalent legacy arcade path used only as a third-party fallback when
+// the self-hosted service is unreachable or errors.
+async function chaintracksGet(v2Path: string, arcadePath: string): Promise<any> {
+  try {
+    const r = await fetch(`${HEADERS_URL}${v2Path}`)
+    if (r.ok) {
+      const body = await r.json()
+      // chaintracks envelope: { status, value } — unwrap to bare header.
+      if (body && body.status === 'success') return body.value
+      // Enveloped error (e.g. ERR_NOT_FOUND): surface, then try fallback.
+    }
+  } catch {
+    // network error — fall through to the arcade fallback below.
+  }
+  // Fallback: third-party arcade (legacy /chaintracks/v2 path, bare header).
+  return arcadeGet(arcadePath)
+}
+
 // ============================================================================
 // MCP Server — read + script builder only
 // ============================================================================
@@ -289,16 +321,16 @@ const TOOLS = [
   {
     name: 'peck_chain_tip',
     description:
-      'Current BSV chain tip — block height, hash, and time. Served via arcade.gorillapool.io ' +
-      '(Chaintracks). Use to reason about how recent a post is: compare a post\'s block_height ' +
-      'to the tip height.',
+      'Current BSV chain tip — block height, hash, and time. Served via the self-hosted ' +
+      'headers.peck.to (Chaintracks). Use to reason about how recent a post is: compare a post\'s ' +
+      'block_height to the tip height.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'peck_block_at_height',
     description:
       'Get the BSV block header at a specific height (hash, merkleRoot, time, bits). ' +
-      'Served via arcade.gorillapool.io (Chaintracks). Useful for converting a post\'s ' +
+      'Served via the self-hosted headers.peck.to (Chaintracks). Useful for converting a post\'s ' +
       'block_height into a wall-clock time.',
     inputSchema: {
       type: 'object' as const,
@@ -1141,7 +1173,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_chain_tip':
-        text = JSON.stringify(await arcadeGet(`/chaintracks/v2/tip`), null, 2)
+        text = JSON.stringify(
+          await chaintracksGet(`/v2/tip`, `/chaintracks/v2/tip`),
+          null, 2,
+        )
         break
       case 'peck_block_at_height': {
         const h = args?.height
@@ -1149,7 +1184,13 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           text = JSON.stringify({ error: 'height required' })
           break
         }
-        text = JSON.stringify(await arcadeGet(`/chaintracks/v2/header/height/${Number(h)}`), null, 2)
+        text = JSON.stringify(
+          await chaintracksGet(
+            `/v2/header/height/${Number(h)}`,
+            `/chaintracks/v2/header/height/${Number(h)}`,
+          ),
+          null, 2,
+        )
         break
       }
       case 'peck_user_posts': {
