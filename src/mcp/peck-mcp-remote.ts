@@ -37,6 +37,8 @@ const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
 const OVERLAY_URL = process.env.PECK_READER_URL || 'https://overlay.peck.to'
 const IDENTITY_URL = process.env.IDENTITY_URL || 'https://identity.peck.to'
+// /v1/register er token-låst (internt skrive-endepunkt; kjeden er kanonisk).
+const IDENTITY_REGISTER_TOKEN = process.env.IDENTITY_REGISTER_TOKEN || ''
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
 // Block headers (Chaintracks). Primary = the fleet's self-hosted
 // headers.peck.to (chaintracks-server); ARCADE_URL is kept only as a
@@ -1573,7 +1575,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           try {
             const idResp = await fetch(`${IDENTITY_URL}/v1/register`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                ...(IDENTITY_REGISTER_TOKEN !== '' ? { Authorization: `Bearer ${IDENTITY_REGISTER_TOKEN}` } : {}),
+              },
               body: JSON.stringify({
                 identityKey: pubKeyHex,
                 handle,
