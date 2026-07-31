@@ -61,3 +61,14 @@ __pycache__/
 /wallet_*.ts
 /check_sig.ts
 /classics-actions.ts
+
+# --- interne agent-/dev-filer: aldri i git (public repo) ---
+AGENTS.md
+IN_FLIGHT.md
+ORCHESTRATION.md
+RUNBOOK*.md
+CONVERGENCE*.md
+*.privat.md
+.gemini/
+.geminirules
+.claude/
