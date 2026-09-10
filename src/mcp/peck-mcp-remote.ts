@@ -39,6 +39,19 @@ const OVERLAY_URL = process.env.PECK_READER_URL || 'https://overlay.peck.to'
 const IDENTITY_URL = process.env.IDENTITY_URL || 'https://identity.peck.to'
 // /v1/register er token-låst (internt skrive-endepunkt; kjeden er kanonisk).
 const IDENTITY_REGISTER_TOKEN = process.env.IDENTITY_REGISTER_TOKEN || ''
+/**
+ * Uten Bearer-headeren svarer identity.peck.to 401 «internal token required»
+ * (identity-services/backend/src/internalAuth.ts). Det er umulig å skille fra
+ * en ekte auth-feil ovenfra, så vi feiler heller eksplisitt her: en glemt
+ * env-var skal være synlig, ikke se ut som et avvist token.
+ */
+const IDENTITY_TOKEN_MISSING_MSG =
+  'IDENTITY_REGISTER_TOKEN is not set for this peck-mcp process, but identity.peck.to /v1/register is token-locked. ' +
+  'Run peck-mcp with the internal register token (the same value identity-services has in REGISTER_TOKENS) and retry.'
+const identityRegisterHeaders = (): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  ...(IDENTITY_REGISTER_TOKEN !== '' ? { Authorization: `Bearer ${IDENTITY_REGISTER_TOKEN}` } : {}),
+})
 const APP_NAME = process.env.APP_NAME || 'peck.agents'
 // Block headers (Chaintracks). Primary = the fleet's self-hosted
 // headers.peck.to (chaintracks-server); ARCADE_URL is kept only as a
@@ -1575,10 +1588,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           try {
             const idResp = await fetch(`${IDENTITY_URL}/v1/register`, {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                ...(IDENTITY_REGISTER_TOKEN !== '' ? { Authorization: `Bearer ${IDENTITY_REGISTER_TOKEN}` } : {}),
-              },
+              headers: identityRegisterHeaders(),
               body: JSON.stringify({
                 identityKey: pubKeyHex,
                 handle,
@@ -1713,10 +1723,14 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           })
           break
         }
+        if (IDENTITY_REGISTER_TOKEN === '') {
+          text = JSON.stringify({ error: IDENTITY_TOKEN_MISSING_MSG })
+          break
+        }
         try {
-          const resp = await fetch('https://identity.peck.to/v1/register', {
+          const resp = await fetch(`${IDENTITY_URL}/v1/register`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: identityRegisterHeaders(),
             body: JSON.stringify({ identityKey, handle, displayName, type: entityType }),
           })
           const body = await resp.text()
@@ -1805,18 +1819,23 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           result.layers.profile_tx = { error: e.message }
         }
 
-        // LAYER 2 — identity.peck.to registry entry (unauthenticated /v1/register)
+        // LAYER 2 — identity.peck.to registry entry. Skrive-endepunktet er
+        // token-låst; uten Bearer svarer tjenesten 401 «internal token required».
         try {
-          const resp = await fetch(`${IDENTITY_URL}/v1/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ identityKey, handle, displayName, type: entityType }),
-          })
-          const body = await resp.text()
-          if (!resp.ok) {
-            result.layers.registry = { error: `${resp.status} ${body.slice(0, 200)}` }
+          if (IDENTITY_REGISTER_TOKEN === '') {
+            result.layers.registry = { error: IDENTITY_TOKEN_MISSING_MSG }
           } else {
-            result.layers.registry = { status: 'registered', response: JSON.parse(body || '{}') }
+            const resp = await fetch(`${IDENTITY_URL}/v1/register`, {
+              method: 'POST',
+              headers: identityRegisterHeaders(),
+              body: JSON.stringify({ identityKey, handle, displayName, type: entityType }),
+            })
+            const body = await resp.text()
+            if (!resp.ok) {
+              result.layers.registry = { error: `${resp.status} ${body.slice(0, 200)}` }
+            } else {
+              result.layers.registry = { status: 'registered', response: JSON.parse(body || '{}') }
+            }
           }
         } catch (e: any) {
           result.layers.registry = { error: `unreachable: ${e.message}` }
