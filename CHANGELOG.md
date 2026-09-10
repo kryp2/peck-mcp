@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2
+
+- **Fix: the identity tools now send the register token.** `identity.peck.to`
+  `/v1/register` is token-locked, but only `peck_profile_tx` was ever given the
+  `Authorization` header (in #21). `peck_register_identity` and the registry
+  layer of `peck_set_identity` called it with no header at all, so both failed
+  with `401 internal token required` whether or not `IDENTITY_REGISTER_TOKEN`
+  was set. All three call sites now share one `identityRegisterHeaders()` helper.
+- When the token is unset, those two paths fail with an explicit error naming
+  the env var, instead of an opaque 401 indistinguishable from a rejected token.
+- `peck_register_identity` now honours `IDENTITY_URL` rather than a hardcoded
+  host.
+
 ## 0.6.1
 
 - **Fix: writes now broadcast at 100 sat/KB, not 1.** The `bitcoin-agent-wallet`
