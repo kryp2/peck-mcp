@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0
+
+- **Hosted read-only mode.** The HTTP transport now serves without loading a
+  wallet and advertises only the 17 read tools (`hosted.ts`). Write tools return
+  an install hint instead of "wallet unavailable", and `peck_messages` refuses a
+  `signing_key` on the hosted server. `PECK_MCP_ALLOW_WRITES=1` restores the full
+  set for HTTP on your own machine; stdio (the npm install path) is unchanged.
+- The same process serves the landing page on `/` for browsers, JSON for agents
+  and curl, plus `/llms.txt`, `/robots.txt` and `/sitemap.xml`. This is what
+  `https://mcp.peck.to` runs, so `claude mcp add --transport http peck
+  https://mcp.peck.to/mcp` works with no install.
+- Listed in the MCP Registry as `io.github.kryp2/peck-mcp` (`server.json`,
+  `mcpName` in package.json, tag-driven publish workflow).
+- Server version now comes from package.json instead of a hardcoded `3.1.0`.
+
 ## 0.6.2
 
 - **Fix: the identity tools now send the register token.** `identity.peck.to`

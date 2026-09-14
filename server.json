@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.kryp2/peck-mcp",
+  "title": "peck-mcp",
+  "description": "BSV wallet, BRC-100 identity and 38 tools to read and write the Bitcoin Schema social graph",
+  "version": "0.7.0",
+  "websiteUrl": "https://mcp.peck.to",
+  "repository": {
+    "url": "https://github.com/kryp2/peck-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "peck-mcp",
+      "version": "0.7.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PECK_NETWORK",
+          "description": "BSV network: main (default) or test",
+          "isRequired": false,
+          "default": "main"
+        },
+        {
+          "name": "PECK_READER_URL",
+          "description": "Overlay read endpoint (default https://overlay.peck.to)",
+          "isRequired": false,
+          "default": "https://overlay.peck.to"
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.peck.to/mcp"
+    }
+  ]
+}

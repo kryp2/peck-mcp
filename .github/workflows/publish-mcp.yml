@@ -1,0 +1,67 @@
+name: Publish to npm and the MCP Registry
+
+# Fires on a version tag (v0.7.0). Publishes the npm package when NPM_TOKEN is
+# configured, then publishes server.json to registry.modelcontextprotocol.io via
+# GitHub OIDC (namespace io.github.kryp2). Without NPM_TOKEN the registry entry
+# is published with the hosted remote only, since the registry verifies npm
+# ownership through the mcpName field of the published package.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Install libsecret (keytar via bitcoin-agent-wallet)
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+      - name: Check tag matches package.json and server.json
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(node -p "require('./package.json').version")
+          SRV=$(node -p "require('./server.json').version")
+          echo "tag=$TAG package.json=$PKG server.json=$SRV"
+          test "$TAG" = "$PKG" && test "$TAG" = "$SRV"
+
+      - name: Decide whether npm publishing is configured
+        id: npm
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; else echo "enabled=false" >> "$GITHUB_OUTPUT"; fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm
+        if: steps.npm.outputs.enabled == 'true'
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Drop the npm package from server.json when npm publishing is off
+        if: steps.npm.outputs.enabled != 'true'
+        run: |
+          echo "NPM_TOKEN not set: publishing the registry entry with the hosted remote only."
+          jq 'del(.packages)' server.json > server.tmp && mv server.tmp server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to the MCP Registry
+        run: ./mcp-publisher publish

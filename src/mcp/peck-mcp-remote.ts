@@ -24,7 +24,10 @@ import {
 import { randomUUID, randomBytes } from 'crypto'
 import { PrivateKey, PublicKey, P2PKH, Script, OP, ProtoWallet, AuthFetch } from '@bsv/sdk'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, dirname, resolve } from 'path'
+import { readFileSync, existsSync } from 'fs'
+import { fileURLToPath } from 'url'
+import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT } from './hosted.js'
 import {
   BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts,
   buildPost as bawBuildPost, buildRepost as bawBuildRepost,
@@ -59,6 +62,16 @@ const APP_NAME = process.env.APP_NAME || 'peck.agents'
 // See chaintracksGet() below.
 const HEADERS_URL = process.env.HEADERS_URL || 'https://headers.peck.to'
 const ARCADE_URL = process.env.ARCADE_URL || 'https://arcade.gorillapool.io'
+
+// Hosted mode: HTTP transport is read-only unless PECK_MCP_ALLOW_WRITES=1 (see hosted.ts).
+const READ_ONLY = isReadOnlyMode()
+const _HERE = dirname(fileURLToPath(import.meta.url))
+const PKG_VERSION: string = (() => {
+  try { return JSON.parse(readFileSync(resolve(_HERE, '..', '..', 'package.json'), 'utf8')).version || '0.0.0' }
+  catch { return '0.0.0' }
+})()
+// Landing page + llms.txt for the hosted deployment live in <repo>/static (not shipped to npm).
+const STATIC_DIR = resolve(_HERE, '..', '..', 'static')
 
 // ============================================================================
 // Agent wallet bootstrap — MCP owns its own BRC-100 identity via peck-agent-
@@ -173,7 +186,11 @@ async function initAgentWallet(): Promise<void> {
   }
 }
 
-await initAgentWallet()
+if (READ_ONLY) {
+  console.error('[peck-mcp] hosted read-only mode: wallet not loaded, write tools hidden (PECK_MCP_ALLOW_WRITES=1 to override)')
+} else {
+  await initAgentWallet()
+}
 
 // Bitcoin Schema protocol prefixes are imported from bitcoin-agent-wallet —
 // single source of truth for the canonical AIP signing implementation.
@@ -225,7 +242,7 @@ async function chaintracksGet(v2Path: string, arcadePath: string): Promise<any> 
 // ============================================================================
 
 const mcpServer = new Server(
-  { name: 'peck-mcp', version: '3.1.0' },
+  { name: 'peck-mcp', version: PKG_VERSION },
   { capabilities: { tools: {} } },
 )
 
@@ -1132,7 +1149,10 @@ function buildMapOnly(type: string, fields: Record<string, string>, signingKey: 
 // Tool handlers
 // ============================================================================
 
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
+// In hosted read-only mode only the read tools are advertised.
+const VISIBLE_TOOLS = READ_ONLY ? filterHostedTools(TOOLS) : TOOLS
+
+mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: VISIBLE_TOOLS }))
 
 async function handleToolCall(name: string, args: any): Promise<string> {
     let text: string = ''
@@ -2236,6 +2256,10 @@ async function handleToolCall(name: string, args: any): Promise<string> {
 
 mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params
+  if (READ_ONLY) {
+    const refusal = hostedRefusal(name, args as any)
+    if (refusal) return { content: [{ type: 'text', text: refusal }] }
+  }
   let text: string
   try {
     text = await handleToolCall(name, args)
@@ -2255,12 +2279,16 @@ const sessions = new Map<string, { server: Server; transport: StreamableHTTPServ
 
 function createSessionServer(): Server {
   const srv = new Server(
-    { name: 'peck-mcp', version: '3.1.0' },
+    { name: 'peck-mcp', version: PKG_VERSION },
     { capabilities: { tools: {} } },
   )
-  srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
+  srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: VISIBLE_TOOLS }))
   srv.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     const { name, arguments: args } = request.params
+    if (READ_ONLY) {
+      const refusal = hostedRefusal(name, args as any)
+      if (refusal) return { content: [{ type: 'text', text: refusal }] }
+    }
     let text: string
     try {
       text = await handleToolCall(name, args)
@@ -2273,17 +2301,49 @@ function createSessionServer(): Server {
   return srv
 }
 
+function serveStatic(res: ServerResponse, fname: string, type: string) {
+  // Only files that resolve inside STATIC_DIR; no traversal, no dotfiles.
+  const fp = resolve(STATIC_DIR, fname)
+  if (!fp.startsWith(STATIC_DIR + '/') || fname.includes('..') || fname.startsWith('.') || !existsSync(fp)) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('not found')
+  }
+  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'public, max-age=300' })
+  return res.end(readFileSync(fp))
+}
+
 const httpServer = createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, mcp-session-id')
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
-  if (req.url === '/' || req.url === '/health') {
+  const path = (req.url || '/').split('?')[0]
+  const wantsHtml = /text\/html/i.test(String(req.headers['accept'] || ''))
+
+  // Landing page for browsers; JSON for agents and curl. Same URL, one service.
+  if (path === '/' && wantsHtml && req.method === 'GET') return serveStatic(res, 'index.html', 'text/html; charset=utf-8')
+  if (req.method === 'GET') {
+    if (path === '/llms.txt') return serveStatic(res, 'llms.txt', 'text/plain; charset=utf-8')
+    if (path === '/robots.txt') return serveStatic(res, 'robots.txt', 'text/plain; charset=utf-8')
+    if (path === '/sitemap.xml') return serveStatic(res, 'sitemap.xml', 'application/xml')
+    if (path.startsWith('/static/')) {
+      const fname = path.slice('/static/'.length)
+      const type = fname.endsWith('.png') ? 'image/png' : fname.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream'
+      return serveStatic(res, fname, type)
+    }
+  }
+
+  if (path === '/' || path === '/health' || path === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     return res.end(JSON.stringify({
       service: 'peck-mcp',
-      version: '3.1.0',
+      version: PKG_VERSION,
+      mode: READ_ONLY ? 'hosted-read-only' : 'full',
+      hosted: READ_ONLY ? {
+        note: HOSTED_INSTALL_HINT,
+        llms_txt: 'https://mcp.peck.to/llms.txt',
+        fleet: 'https://datamynt.no/.well-known/fleet.json',
+      } : undefined,
       summary:
         'Bitcoin-native MCP server. Lets AI agents read and write a public social graph that lives on the BSV blockchain. Works alongside peck.to (the human web frontend) — same chain, two interfaces.',
       if_you_have_no_context:
@@ -2306,7 +2366,8 @@ const httpServer = createServer(async (req, res) => {
       endpoints: { mcp: '/mcp', health: '/' },
       add_to_claude_code: 'claude mcp add --transport http peck https://mcp.peck.to/mcp',
       tools: {
-        count: TOOLS.length,
+        count: VISIBLE_TOOLS.length,
+        total_local: TOOLS.length,
         categories: ['discovery', 'identity', 'social', 'messaging', 'payments', 'functions', 'memory', 'chain'],
         reference: 'https://docs.peck.to/tools',
       },
@@ -2392,7 +2453,7 @@ if (USE_STDIO) {
   console.error(`[peck-mcp] network: ${NETWORK}`)
 } else {
   httpServer.listen(PORT, () => {
-    console.log(`[peck-mcp] v3.0.0 — read + build, no signing`)
+    console.log(`[peck-mcp] v${PKG_VERSION} — ${READ_ONLY ? 'hosted read-only (no wallet)' : 'full (writes enabled)'}`)
     console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
     console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
     console.log(`[peck-mcp] network: ${NETWORK}`)

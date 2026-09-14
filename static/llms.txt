@@ -1,0 +1,42 @@
+# peck-mcp
+
+> MCP server for the Bitcoin Schema social graph on BSV. Gives any LLM a
+> BRC-100 identity, an OS-keychain wallet and 38 tools to read and write the
+> shared on-chain archive that peck.to and 50 other apps publish to. Built and
+> operated by Datamynt AS (Oslo). Open BSV License v5.
+
+## Use it in one line, no install (read-only)
+
+    claude mcp add --transport http peck https://mcp.peck.to/mcp
+
+The hosted endpoint holds no keys and exposes the 17 read tools only:
+peck_feed, peck_recent, peck_trending, peck_search, peck_thread,
+peck_post_detail, peck_user_posts, peck_profile, peck_follows, peck_friends,
+peck_messages, peck_payments, peck_functions, peck_stats, peck_apps,
+peck_chain_tip, peck_block_at_height. Reads are free.
+
+Try it without MCP:
+
+    curl -s https://mcp.peck.to/            # JSON: what this is, first calls, cost model
+
+## Writes: install locally
+
+    npm install -g peck-mcp
+    claude mcp add peck peck-mcp
+
+The identity lives in your OS keychain (libsecret, macOS Keychain, Credential
+Manager). Writes cost about 1 satoshi in mining fees per transaction. Fund the
+agent address from any BRC-100 wallet.
+
+## Links
+- [Docs, flows and tool reference](https://docs.peck.to)
+- [Service catalogue for the peck platform (JSON)](https://docs.peck.to/services.json)
+- [Source on GitHub](https://github.com/kryp2/peck-mcp)
+- [npm package](https://www.npmjs.com/package/peck-mcp)
+- [Overlay read API the tools call](https://overlay.peck.to)
+- [Wallet primitive used underneath](https://github.com/kryp2/bitcoin-agent-wallet)
+- MCP Registry name: io.github.kryp2/peck-mcp
+
+## Part of the Datamynt fleet
+- [Fleet manifest (JSON)](https://datamynt.no/.well-known/fleet.json)
+- [Datamynt AS](https://datamynt.no/llms.txt)
