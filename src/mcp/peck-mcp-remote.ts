@@ -28,6 +28,8 @@ import { join, dirname, resolve } from 'path'
 import { readFileSync, existsSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT } from './hosted.js'
+import { describeWalletInitFailure, type WalletInitFailure } from './wallet-diagnostics.js'
+import { monitorOf, syncProofs } from './proof-sync.js'
 import {
   BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts,
   buildPost as bawBuildPost, buildRepost as bawBuildRepost,
@@ -102,6 +104,54 @@ const agents = new Map<string, LoadedAgent>()
 let agentWallet: BitcoinAgentWallet | null = null
 let agentKey: PrivateKey | null = null   // used by Bitcoin Schema script builders (AIP signing)
 
+// Why the last wallet bootstrap for an account failed, and the public identity
+// of a key that did load from the keychain even though its storage would not
+// open. peck_identity_info reports both, so a broken install is not mistaken
+// for a missing identity (see wallet-diagnostics.ts).
+const walletInitFailures = new Map<string, WalletInitFailure>()
+const keychainIdentities = new Map<string, { identityKey: string; address: string }>()
+
+// A block is ~10 minutes; checking more often than that finds nothing new.
+const PROOF_SYNC_INTERVAL_MS = 10 * 60_000
+
+/** Record merkle proofs for this wallet's mined transactions now and every
+ *  PROOF_SYNC_INTERVAL_MS (see proof-sync.ts for why this is required). */
+function startProofSync(account: string, wallet: BitcoinAgentWallet): void {
+  const monitor = monitorOf(wallet)
+  if (!monitor) {
+    console.error(`[peck-mcp] proof sync unavailable for '${account}' (wallet internals changed) — long chains of writes will hit the BEEF depth limit.`)
+    return
+  }
+  let running = false
+  const run = async () => {
+    if (running) return
+    running = true
+    try {
+      const log = await syncProofs(monitor)
+      if (/completed/.test(log)) console.error(`[peck-mcp] proof sync for '${account}': recorded merkle proofs for mined transactions`)
+    } catch (e: any) {
+      console.error(`[peck-mcp] proof sync for '${account}' failed: ${e?.message || e}`)
+    } finally {
+      running = false
+    }
+  }
+  void run()
+  setInterval(run, PROOF_SYNC_INTERVAL_MS).unref()
+}
+
+/** Record a bootstrap failure and return an error whose message carries the fix,
+ *  so write-tools that hit it (via loadAgent) tell the caller what to do. */
+function walletInitError(account: string, failure: WalletInitFailure): Error {
+  walletInitFailures.set(account, failure)
+  return new Error(`${failure.error}\n\nfix: ${failure.hint}`)
+}
+
+function walletDbPath(account: string): string {
+  if (process.env.PECK_MCP_WALLET_DB && account === 'default') return process.env.PECK_MCP_WALLET_DB
+  const dbSuffix = account === 'default' ? '' : `-${account}`
+  return join(homedir(), `.peck-mcp-wallet${dbSuffix}.db`)
+}
+
 /** Resolve + cache a BitcoinAgentWallet for the given keychain account.
  *  Returns null if the account has no identity stored. Safe to call from any
  *  handler — subsequent calls for the same account reuse the cached wallet. */
@@ -109,29 +159,37 @@ async function loadAgent(account: string): Promise<LoadedAgent | null> {
   const cached = agents.get(account)
   if (cached) return cached
   let hex: string | null
-  if (account === 'default') {
-    // Back-compat path: also migrate legacy ~/.peck/identity.json on first run.
-    hex = await getOrMigrateIdentityKey()
-  } else {
-    hex = await loadIdentityKey({ account })
+  try {
+    if (account === 'default') {
+      // Back-compat path: also migrate legacy ~/.peck/identity.json on first run.
+      hex = await getOrMigrateIdentityKey()
+    } else {
+      hex = await loadIdentityKey({ account })
+    }
+  } catch (e) {
+    throw walletInitError(account, describeWalletInitFailure('keychain', e))
   }
   if (!hex) return null
   const key = PrivateKey.fromHex(hex)
-  const dbSuffix = account === 'default' ? '' : `-${account}`
+  keychainIdentities.set(account, {
+    identityKey: key.toPublicKey().toString(),
+    address: key.toAddress(NETWORK === 'main' ? 'mainnet' : 'testnet') as string,
+  })
   const wallet = new BitcoinAgentWallet({
     privateKeyHex: hex,
     network: NETWORK as 'main' | 'test',
     appName: APP_NAME,
-    storage: {
-      kind: 'sqlite',
-      filePath: process.env.PECK_MCP_WALLET_DB && account === 'default'
-        ? process.env.PECK_MCP_WALLET_DB
-        : join(homedir(), `.peck-mcp-wallet${dbSuffix}.db`),
-    },
+    storage: { kind: 'sqlite', filePath: walletDbPath(account) },
   })
-  await wallet.init()
+  try {
+    await wallet.init()
+  } catch (e) {
+    throw walletInitError(account, describeWalletInitFailure('storage', e))
+  }
+  walletInitFailures.delete(account)
   const loaded: LoadedAgent = { wallet, key }
   agents.set(account, loaded)
+  startProofSync(account, wallet)
   console.error(`[peck-mcp] wallet ready for '${account}' — identityKey=${wallet.getIdentityKey().slice(0, 16)}…`)
   return loaded
 }
@@ -646,7 +704,10 @@ const TOOLS = [
 
   {
     name: 'peck_balance',
-    description: 'Check BSV balance for any address via WhatsOnChain. Use with your address from ~/.peck/identity.json.',
+    description:
+      'Check the on-chain P2PKH balance of any BSV address via WhatsOnChain. ' +
+      "This is NOT this MCP's own wallet balance: the agent wallet holds BRC-29 outputs derived from its " +
+      'identity key, so its P2PKH address reads 0 even when funded. Use peck_identity_info (wallet_balance_sats) for that.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -660,10 +721,9 @@ const TOOLS = [
   {
     name: 'peck_identity_info',
     description:
-      'Instructions for setting up your agent identity. ' +
-      'Run `npx peck-init` locally to create ~/.peck/identity.json. ' +
-      'This gives you a BSV address for posting. Fund it to enable writing. ' +
-      'All CLI tools (Claude Code, OpenCode, Gemini CLI) share the same identity.',
+      "Show this MCP's agent identity (OS-keychain key), whether its wallet is ready, the wallet's " +
+      'spendable balance, and — when the wallet is not ready — the exact error and how to fix it. ' +
+      'All local CLI tools (Claude Code, OpenCode, Gemini CLI) share the same identity.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -1692,15 +1752,39 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       // ─── IDENTITY ───
       case 'peck_identity_info': {
         const walletReady = !!agentWallet
-        const identityKey = walletReady ? agentWallet!.getIdentityKey() : null
-        const address = walletReady ? agentWallet!.getAddress() : null
+        const failure = walletInitFailures.get('default') ?? null
+        // The key can load while the wallet storage does not; report it anyway so
+        // a broken install never reads as "no identity".
+        const fromKeychain = keychainIdentities.get('default') ?? null
+        const identityKey = walletReady ? agentWallet!.getIdentityKey() : fromKeychain?.identityKey ?? null
+        const address = walletReady ? agentWallet!.getAddress() : fromKeychain?.address ?? null
+        let walletBalanceSats: number | null = null
+        let walletBalanceError: string | undefined
+        if (walletReady) {
+          try {
+            walletBalanceSats = await (agentWallet!.getWalletClient() as any).balance()
+          } catch (e: any) {
+            walletBalanceError = String(e?.message || e)
+          }
+        }
+        const keyFound = walletReady || fromKeychain !== null
         text = JSON.stringify({
           wallet_ready: walletReady,
           identity_key: identityKey,
           address,
+          keychain_key_found: keyFound,
+          ...(failure ? { wallet_error: failure.error, wallet_error_stage: failure.stage, fix: failure.hint } : {}),
+          wallet_storage: walletDbPath('default'),
+          wallet_balance_sats: walletBalanceSats,
+          ...(walletBalanceError ? { wallet_balance_error: walletBalanceError } : {}),
+          balance_note:
+            'Funds live in wallet_storage as BRC-29 outputs derived from identity_key, not at the P2PKH address; ' +
+            'peck_balance(address) reads 0 even when this wallet is funded.',
           storage: 'OS keychain (libsecret / Keychain / Credential Manager) via bitcoin-agent-wallet',
           setup_instructions: walletReady
-            ? ['Identity ready. Fund the address above to enable writes.']
+            ? ['Identity ready. Fund the wallet with a BRC-29 PeerPay payment to identity_key (see peck_request_payment); a plain send to the P2PKH address is not picked up by the wallet.']
+            : keyFound || (failure && !failure.missingKey)
+            ? [failure?.hint ?? 'Wallet bootstrap failed — restart peck-mcp and check its stderr.']
             : [
               '1. Install peck-mcp locally (keychain access requires a local install, not the hosted mcp.peck.to).',
               '2. First run auto-migrates any legacy ~/.peck/identity.json into the OS keychain.',
@@ -1719,7 +1803,7 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           network: NETWORK,
           next_step: walletReady
             ? 'Call peck_register_identity with your handle + display_name + identity_key so other apps can find you and route BRC-42 payments to you.'
-            : 'Resolve wallet bootstrap first — see setup_instructions.',
+            : failure ? `Resolve wallet bootstrap first — ${failure.hint}` : 'Resolve wallet bootstrap first — see setup_instructions.',
         }, null, 2)
         break
       }
