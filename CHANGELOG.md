@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Fix: the wallet can keep writing.** wallet-toolbox only records merkle
+  proofs when its Monitor runs, and nothing started it, so every post chained on
+  unproven parents until `createAction` failed with `Maximum BEEF depth
+  exceeded` (limit 12). peck-mcp now runs the Monitor's `CheckForProofs` task at
+  start and every 10 minutes (`proof-sync.ts`). No other Monitor task runs: in
+  particular `TaskSendWaiting`, which would broadcast queued delayed PeerPay
+  payments, stays off.
+- **Fix: a broken install no longer looks like a missing identity.** When the
+  key loads from the keychain but the wallet store fails to open (for example
+  better-sqlite3 built for Node 22 running under Node 24), `peck_identity_info`
+  now reports the key's `identity_key` and `address`, `keychain_key_found`,
+  `wallet_error`, and a concrete fix. It no longer tells the caller to generate
+  a fresh key, which would replace the identity. Write tools that hit the
+  failure return the same fix (`wallet-diagnostics.ts`).
+- `peck_identity_info` reports `wallet_storage` and `wallet_balance_sats`, and
+  says to fund the wallet with a BRC-29 PeerPay payment: a plain send to the
+  P2PKH address is not picked up by the wallet. `peck_balance` says it reads the
+  P2PKH address only.
+
 ## 0.7.0
 
 - **Hosted read-only mode.** The HTTP transport now serves without loading a
