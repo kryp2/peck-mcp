@@ -2410,6 +2410,15 @@ const httpServer = createServer(async (req, res) => {
     if (path === '/llms.txt') return serveStatic(res, 'llms.txt', 'text/plain; charset=utf-8')
     if (path === '/robots.txt') return serveStatic(res, 'robots.txt', 'text/plain; charset=utf-8')
     if (path === '/sitemap.xml') return serveStatic(res, 'sitemap.xml', 'application/xml')
+    // Brand kit assets served at web root so browsers find them at the conventional paths.
+    if (path === '/favicon.ico') return serveStatic(res, 'favicon.ico', 'image/x-icon')
+    if (path === '/favicon.svg') return serveStatic(res, 'favicon.svg', 'image/svg+xml')
+    if (path === '/apple-touch-icon.png') return serveStatic(res, 'apple-touch-icon.png', 'image/png')
+    if (path === '/icon-192.png') return serveStatic(res, 'icon-192.png', 'image/png')
+    if (path === '/icon-512.png') return serveStatic(res, 'icon-512.png', 'image/png')
+    if (path === '/icon-maskable-512.png') return serveStatic(res, 'icon-maskable-512.png', 'image/png')
+    if (path === '/site.webmanifest') return serveStatic(res, 'site.webmanifest', 'application/manifest+json')
+    if (path === '/og.png') return serveStatic(res, 'og.png', 'image/png')
     if (path.startsWith('/static/')) {
       const fname = path.slice('/static/'.length)
       const type = fname.endsWith('.png') ? 'image/png' : fname.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream'
