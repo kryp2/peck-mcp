@@ -220,9 +220,18 @@ async function initAgentWallet(): Promise<void> {
     // The other public message servers. BSV Desktop, BSV Browser and Peck OS send
     // PeerPay through gmb.bsvblockchain.tech; the wallet above only polls msg.peck.to.
     const otherInboxes = openInboxes(agentWallet.getWalletClient())
+    let lastInboxFailures: string | null = null
     const pollOtherInboxes = async (when: string): Promise<void> => {
       const r = await pollInboxes(otherInboxes, m => console.error(m))
       if (r.accepted > 0) console.error(`[peck-mcp] ${when} — accepted ${r.accepted} payment(s), ${r.sats} sats, from other message servers`)
+      // Say when a host stops (or starts) answering, not on every 60 s poll.
+      const failures = r.failed.map(([h, m]) => `${h} (${m})`).join(', ')
+      if (failures !== lastInboxFailures) {
+        console.error(failures
+          ? `[peck-mcp] ${when} — payments not readable on: ${failures}`
+          : `[peck-mcp] ${when} — polling payments on ${[...otherInboxes.keys()].join(', ')}`)
+        lastInboxFailures = failures
+      }
     }
     await pollOtherInboxes('startup poll').catch((e: any) => console.error(`[peck-mcp] startup poll of other message servers failed: ${e?.message || e}`))
 
