@@ -46,6 +46,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@bsv/message-box-client": "^2.1.0",
     "@bsv/sdk": "^2.0.13",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "bitcoin-agent-wallet": "^0.5.3",

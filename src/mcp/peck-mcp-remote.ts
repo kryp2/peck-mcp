@@ -30,6 +30,7 @@ import { fileURLToPath } from 'url'
 import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT } from './hosted.js'
 import { describeWalletInitFailure, type WalletInitFailure } from './wallet-diagnostics.js'
 import { monitorOf, syncProofs } from './proof-sync.js'
+import { openInboxes, pollInboxes } from './payment-inboxes.js'
 import {
   BitcoinAgentWallet, getOrMigrateIdentityKey, loadIdentityKey, storeIdentityKey, listIdentityAccounts,
   buildPost as bawBuildPost, buildRepost as bawBuildRepost,
@@ -216,6 +217,15 @@ async function initAgentWallet(): Promise<void> {
       console.error(`[peck-mcp] startup payment poll failed: ${e?.message || e}`)
     }
 
+    // The other public message servers. BSV Desktop, BSV Browser and Peck OS send
+    // PeerPay through gmb.bsvblockchain.tech; the wallet above only polls msg.peck.to.
+    const otherInboxes = openInboxes(agentWallet.getWalletClient())
+    const pollOtherInboxes = async (when: string): Promise<void> => {
+      const r = await pollInboxes(otherInboxes, m => console.error(m))
+      if (r.accepted > 0) console.error(`[peck-mcp] ${when} — accepted ${r.accepted} payment(s), ${r.sats} sats, from other message servers`)
+    }
+    await pollOtherInboxes('startup poll').catch((e: any) => console.error(`[peck-mcp] startup poll of other message servers failed: ${e?.message || e}`))
+
     // Live WS listener — incoming BRC-29 payments auto-internalize as they arrive.
     // Messagebox WS pushes each payment token; PeerPayClient's default handler
     // runs wallet.internalizeAction automatically, no polling gap.
@@ -235,6 +245,7 @@ async function initAgentWallet(): Promise<void> {
       } catch (e: any) {
         console.error(`[peck-mcp] safety-poll error: ${e?.message || e}`)
       }
+      await pollOtherInboxes('safety-poll').catch((e: any) => console.error(`[peck-mcp] safety-poll of other message servers failed: ${e?.message || e}`))
     }, 60_000).unref()
   } catch (e: any) {
     console.error(`[peck-mcp] wallet init failed: ${e?.message || e}`)
