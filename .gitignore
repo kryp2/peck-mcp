@@ -12,12 +12,11 @@ dist/
 .DS_Store
 *.log
 
-# Internal: deploy config, hackathon notes, dev notes (kept local, not in public repo)
+# Internal: deploy config, hackathon notes, dev notes (kept local, not in public repo).
+# The root Dockerfile and .dockerignore are tracked: they build the hosted read-only server.
 CLAUDE.md
-Dockerfile
 Dockerfile.*
 cloudbuild*.yaml
-.dockerignore
 .gcloudignore
 HACKATHON_SUBMISSION.md
 RUN_LOG.md
