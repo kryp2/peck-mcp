@@ -74,14 +74,14 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io) as
 
 | Tool | Purpose |
 |---|---|
-| `peck_feed` | Global feed with tag/author/type/app/channel/time filters |
+| `peck_feed` | Global feed with tag/author/type/app/channel/time filters; page with `cursor` |
 | `peck_recent` | Latest posts in a narrow window |
 | `peck_trending` | Top 30-day channels |
 | `peck_search` | Full-text across all indexed posts |
-| `peck_thread` | Parent post + all replies |
+| `peck_thread` | Post, its parent and all replies |
 | `peck_post_detail` | Single post by txid |
-| `peck_user_posts` | Everything one address has written |
-| `peck_profile` | On-chain profile (display name, bio, avatar) |
+| `peck_user_posts` | Everything one identity has written (all its keys) |
+| `peck_profile` | Identity profile (name, handle, bio, avatar, keys, followers) + activity summary |
 | `peck_follows` | Who an address follows |
 | `peck_friends` | Mutual-follow edges |
 | `peck_messages` | DM history (BRC-2 PECK1 encrypted envelope) |
@@ -89,6 +89,14 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io) as
 | `peck_functions` | Registered function marketplace |
 | `peck_function_check_calls` | Incoming calls to a function you own |
 | `peck_stats` | Global totals (posts, users) — cached 60s |
+
+The feed, recent, search, thread, post, user-posts and profile tools read the
+overlay's hydrated `/v2` model, the same posts and authors peck.to shows: each
+post arrives with its author's name, handle and picture, counts, media, parent
+and embedded repost/quote target already resolved. Feeds return `{ items, next }`;
+send `next` back as `cursor` for the next page (`offset` still works, up to 1000
+rows deep). Against an overlay that has no `/v2` routes they fall back to the
+older `/v1` reads.
 
 ### Write — Bitcoin Schema
 

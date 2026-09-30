@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **Read tools use the overlay's `/v2` read model.** `peck_feed`, `peck_recent`,
+  `peck_search`, `peck_thread`, `peck_post_detail`, `peck_user_posts` and
+  `peck_profile` now return the hydrated `peck-view/v1` objects the overlay
+  serves under `/v2` (the ones peck.to renders), so an agent sees the same
+  author name, handle, avatar, counts, media and repost/quote target as a person.
+  Output shape changes agents will notice:
+  - Lists are `{ items, next }` instead of `{ status, total, offset, data }`;
+    posts are camelCase views (`text`, `createdAt`, `author.displayName`,
+    `counts.replies`, ...) instead of raw index rows. `content_tsv`,
+    `map_content` and base64 attachment blobs are gone; `media[]` carries URLs.
+  - `peck_thread` returns `{ post, parent, replies, repliesTruncated }`. The old
+    `parent` was the requested post; it is now `post`, and `parent` is the post
+    it replies to.
+  - `peck_post_detail` returns `{ post, parent }`.
+  - `peck_user_posts` returns `{ author, keys, items, next }` and includes posts
+    signed by every key of the identity. There is no `total`.
+  - `peck_profile` keeps its fields and adds `profile` (the overlay's profile
+    view) and `keys_counted`; totals and the sample now cover all keys of the
+    identity. `address` also accepts a public key or `@handle` here and in
+    `peck_user_posts`.
+  - `tag` is an exact match (it was a substring match).
+  - New optional `cursor` argument on `peck_feed`, `peck_recent` and
+    `peck_user_posts`: the `next` of the previous page, sent back unchanged.
+    `offset` still works (max offset + limit 1000). `limit` is capped at 100.
+  - Unchanged, still on `/v1`: `peck_trending`, `peck_stats`, `peck_apps`,
+    `peck_follows`, `peck_friends`, `peck_messages`, `peck_payments`,
+    `peck_functions`, `peck_function_check_calls`, and the recipient lookups of
+    the write tools. Post totals in `peck_profile` also come from `/v1`.
+  - An overlay without `/v2` routes (a self-hosted `PECK_READER_URL`, or a
+    rolled-back overlay) is detected and served from `/v1` with the previous output.
 - **Fix: the wallet can keep writing.** wallet-toolbox only records merkle
   proofs when its Monitor runs, and nothing started it, so every post chained on
   unproven parents until `createAction` failed with `Maximum BEEF depth
