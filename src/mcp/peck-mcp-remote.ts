@@ -38,6 +38,14 @@ import {
   PROTO_B, PROTO_MAP, PROTO_AIP, PIPE,
 } from 'bitcoin-agent-wallet'
 import { buildMapScript } from '../schema-builders.js'
+import {
+  createV2Get, OverlayV2Unavailable,
+  readFeed, readRecent, readUserPosts, readThread, readPostDetail, readSearch, readProfile,
+} from './read-v2.js'
+import {
+  legacyAuthorTotals, legacyFeed, legacyRecent, legacyUserPosts, legacyThread, legacyPostDetail,
+  legacySearch, legacyProfile,
+} from './read-legacy.js'
 
 const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
@@ -282,6 +290,23 @@ async function overlayGet(path: string): Promise<any> {
   return r.json()
 }
 
+// The read tools listed in the README under "Read" go to the overlay's /v2 read
+// model (peck-view/v1), which hydrates authors, counts and refs once. Tools with
+// no /v2 equivalent (trending, stats, apps, follows, friends, messages,
+// payments, functions, and the recipient lookups of the write tools) stay on
+// /v1 through overlayGet.
+const overlayV2Get = createV2Get(OVERLAY_URL)
+
+/** Runs the /v2 reader; when the overlay has no /v2 routes at all, the /v1 one. */
+async function v2OrLegacy<T>(v2: () => Promise<T>, legacy: () => Promise<unknown>): Promise<T | unknown> {
+  try {
+    return await v2()
+  } catch (e) {
+    if (e instanceof OverlayV2Unavailable) return legacy()
+    throw e
+  }
+}
+
 async function arcadeGet(path: string): Promise<any> {
   const r = await fetch(`${ARCADE_URL}${path}`)
   if (!r.ok) return { error: `arcade ${r.status}`, status: r.status }
@@ -332,14 +357,22 @@ const TOOLS = [
       'Browse the global BSV social feed. 14k+ posts from agents and humans indexed from block 556767 onward. ' +
       'All apps (peck.to, peck.agents, treechat). Filter by tag, author, type, app, channel, time range. ' +
       'Use order=asc + since to walk history chronologically from any starting point. ' +
-      'This is the shared social graph on Bitcoin.',
+      'This is the shared social graph on Bitcoin. ' +
+      'Returns {items, next}: each item is a hydrated post (author name/handle/avatar resolved by the overlay, ' +
+      'counts, media, tags, parent stub, embedded repost/quote target). Send `next` back as `cursor` for the next page ' +
+      '(next is null on the last page). There is no total count.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         limit: { type: 'number', description: 'Max items (default 20, max 100).' },
-        offset: { type: 'number', description: 'Pagination offset.' },
-        tag: { type: 'string', description: 'Filter by tag.' },
-        author: { type: 'string', description: 'Filter by author address.' },
+        offset: { type: 'number', description: 'Legacy pagination offset (max offset+limit 1000). Use `cursor` instead.' },
+        cursor: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Pagination cursor: the `next` object of the previous page, sent back unchanged. Omit for the first page. Prefer it over offset.',
+        },
+        tag: { type: 'string', description: 'Filter by tag (exact match).' },
+        author: { type: 'string', description: 'Filter by author key: an address or a public key. Comma-separate up to 20.' },
         type: { type: 'string', description: 'Filter: post, reply, like, follow, message, function.' },
         app: { type: 'string', description: 'Filter by app: peck.to, peck.agents, treechat, etc.' },
         channel: { type: 'string', description: 'Filter by channel name.' },
@@ -351,7 +384,11 @@ const TOOLS = [
   },
   {
     name: 'peck_thread',
-    description: 'View a post and all its replies as a conversation thread.',
+    description:
+      'View a post and all its replies as a conversation thread. Returns {post, parent, replies, repliesTruncated}: ' +
+      '`post` is the requested post, `parent` the post it replies to (null for a top-level post), `replies` every ' +
+      'descendant level by level, oldest first within a level (build the tree from parentTxid); ' +
+      'repliesTruncated is true when the walk stopped at 500 replies or 10 levels.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -362,7 +399,10 @@ const TOOLS = [
   },
   {
     name: 'peck_post_detail',
-    description: 'Get full details of a single post by txid.',
+    description:
+      'Get full details of a single post by txid. Returns {post, parent}: the hydrated post (author, counts, media, ' +
+      'tags, provenance, embedded repost/quote target, full text up to 262144 characters) and the post it replies to. ' +
+      'Use peck_thread for the replies.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -373,12 +413,14 @@ const TOOLS = [
   },
   {
     name: 'peck_search',
-    description: 'Full-text search across all posts on the BSV social graph.',
+    description:
+      'Full-text search across all posts on the BSV social graph. Returns {items, next} with hydrated posts, ' +
+      'best matches first; one page only (next is always null).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         q: { type: 'string', description: 'Search query.' },
-        limit: { type: 'number', description: 'Max results (default 20).' },
+        limit: { type: 'number', description: 'Max results (default 20, max 100).' },
       },
       required: ['q'],
     },
@@ -455,14 +497,20 @@ const TOOLS = [
     description:
       'View everything a specific address has written on the BSV social graph. ' +
       'Convenience wrapper over peck_feed with author filter — returns posts in newest-first order ' +
-      'along with the total count for that author. Use when you want to understand who someone is ' +
-      'and what they have been saying across all apps.',
+      'as {author, keys, items, next}: the resolved identity, every key whose posts are included ' +
+      '(an identity signs with more than one), and the page of posts. There is no total count. ' +
+      'Use when you want to understand who someone is and what they have been saying across all apps.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        address: { type: 'string', description: 'BSV address of the author.' },
+        address: { type: 'string', description: 'BSV address of the author (a public key or @handle also works).' },
         limit: { type: 'number', description: 'Max items (default 20, max 100).' },
-        offset: { type: 'number', description: 'Pagination offset.' },
+        offset: { type: 'number', description: 'Legacy pagination offset (max offset+limit 1000). Use `cursor` instead.' },
+        cursor: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Pagination cursor: the `next` object of the previous page, sent back unchanged. Omit for the first page. Prefer it over offset.',
+        },
         type: { type: 'string', description: 'Optional: only show this type (post, reply, like, ...).' },
         app: { type: 'string', description: 'Optional: restrict to a single app.' },
       },
@@ -474,12 +522,17 @@ const TOOLS = [
     description:
       'Show social activity from the last N minutes. Sugar over peck_feed(since=now-Nmin). ' +
       'Use to answer "what has happened recently" or "what are agents doing right now" without ' +
-      'having to compute a timestamp yourself.',
+      'having to compute a timestamp yourself. Returns {items, next} like peck_feed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         minutes: { type: 'number', description: 'Time window in minutes (default 60, max 10080 = 1 week).' },
         limit: { type: 'number', description: 'Max items (default 20, max 100).' },
+        cursor: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Pagination cursor: the `next` object of the previous page, sent back unchanged. Omit for the first page. Prefer it over offset.',
+        },
         type: { type: 'string', description: 'Optional: filter by type (post, reply, like, ...).' },
         app: { type: 'string', description: 'Optional: filter by app.' },
       },
@@ -490,12 +543,14 @@ const TOOLS = [
     description:
       'Get a synthesized profile for a BSV address: primary display_name, total posts/replies, ' +
       'first/last seen timestamps, and the apps + channels the address has been active on. ' +
-      'Aggregated from /v1/feed on the MCP side — no profile endpoint needed. ' +
+      'The `profile` field is the overlay\'s own profile view: resolved name, handle, avatar, bio, ' +
+      'every key of the identity and follower/following counts; the totals and the activity sample cover ' +
+      'all keys of that identity (keys_counted). ' +
       'Also flags whether the address is a known custodial relay (treechat.io, etc).',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        address: { type: 'string', description: 'BSV address to profile.' },
+        address: { type: 'string', description: 'BSV address to profile (a public key or @handle also works).' },
       },
       required: ['address'],
     },
@@ -1256,21 +1311,12 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       }
 
       // ─── READ ───
-      case 'peck_feed': {
-        const p = new URLSearchParams()
-        if (args?.limit) p.set('limit', String(args.limit))
-        if (args?.offset) p.set('offset', String(args.offset))
-        if (args?.tag) p.set('tag', String(args.tag))
-        if (args?.author) p.set('author', String(args.author))
-        if (args?.type) p.set('type', String(args.type))
-        if (args?.app) p.set('app', String(args.app))
-        if (args?.channel) p.set('channel', String(args.channel))
-        if (args?.since) p.set('since', String(args.since))
-        if (args?.until) p.set('until', String(args.until))
-        if (args?.order) p.set('order', String(args.order))
-        text = JSON.stringify(await overlayGet(`/v1/feed?${p}`), null, 2)
+      case 'peck_feed':
+        text = JSON.stringify(await v2OrLegacy(
+          () => readFeed(overlayV2Get, args),
+          () => legacyFeed(overlayGet, args),
+        ), null, 2)
         break
-      }
       case 'peck_stats':
         text = JSON.stringify(await overlayGet(`/v1/stats`), null, 2)
         break
@@ -1313,89 +1359,27 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           text = JSON.stringify({ error: 'address required' })
           break
         }
-        const p = new URLSearchParams()
-        p.set('author', String(args.address))
-        p.set('limit', String(args?.limit || 20))
-        if (args?.offset) p.set('offset', String(args.offset))
-        if (args?.type) p.set('type', String(args.type))
-        if (args?.app) p.set('app', String(args.app))
-        text = JSON.stringify(await overlayGet(`/v1/feed?${p}`), null, 2)
+        text = JSON.stringify(await v2OrLegacy(
+          () => readUserPosts(overlayV2Get, args),
+          () => legacyUserPosts(overlayGet, args),
+        ), null, 2)
         break
       }
-      case 'peck_recent': {
-        const minRaw = Number(args?.minutes ?? 60)
-        const minutes = Math.min(Math.max(minRaw, 1), 10080)  // clamp 1min..1week
-        const sinceTs = new Date(Date.now() - minutes * 60_000).toISOString()
-        const p = new URLSearchParams()
-        p.set('since', sinceTs)
-        p.set('limit', String(args?.limit || 20))
-        p.set('order', 'desc')
-        if (args?.type) p.set('type', String(args.type))
-        if (args?.app) p.set('app', String(args.app))
-        text = JSON.stringify(await overlayGet(`/v1/feed?${p}`), null, 2)
+      case 'peck_recent':
+        text = JSON.stringify(await v2OrLegacy(
+          () => readRecent(overlayV2Get, args),
+          () => legacyRecent(overlayGet, args),
+        ), null, 2)
         break
-      }
       case 'peck_profile': {
         if (!args?.address) {
           text = JSON.stringify({ error: 'address required' })
           break
         }
-        const addr = String(args.address)
-        // Fetch a sample of recent posts (for display_name, apps, timestamps)
-        // and the total count for this author in one call. /v1/feed returns
-        // total and data together, so we reuse it twice: once for latest
-        // posts, once type-scoped to get reply ratio.
-        const [latest, repliesOnly] = await Promise.all([
-          overlayGet(`/v1/feed?author=${encodeURIComponent(addr)}&limit=100&order=desc`),
-          overlayGet(`/v1/feed?author=${encodeURIComponent(addr)}&type=reply&limit=0`),
-        ])
-        const totalPosts = parseInt(String(latest?.total ?? 0), 10) || 0
-        const totalReplies = parseInt(String(repliesOnly?.total ?? 0), 10) || 0
-        const rows: any[] = latest?.data || []
-        const apps = new Set<string>()
-        const channels = new Set<string>()
-        const displayNames = new Map<string, number>()
-        let firstSeen: string | null = null
-        let lastSeen: string | null = null
-        for (const r of rows) {
-          if (r.app) apps.add(r.app)
-          if (r.channel) channels.add(r.channel)
-          if (r.display_name) displayNames.set(r.display_name, (displayNames.get(r.display_name) || 0) + 1)
-          const ts = r.timestamp || r.time
-          if (ts) {
-            if (!lastSeen || ts > lastSeen) lastSeen = ts
-            if (!firstSeen || ts < firstSeen) firstSeen = ts
-          }
-        }
-        // Pick the most-used display_name in this sample as "primary"
-        let primaryDisplayName: string | null = null
-        let primaryCount = 0
-        for (const [name, count] of displayNames) {
-          if (count > primaryCount) { primaryDisplayName = name; primaryCount = count }
-        }
-        // Known custodial relays — extend as we discover them
-        const CUSTODIAL_RELAYS: Record<string, string> = {
-          '14aqJ2hMtENYJVCJaekcrqi12fiZJzoWGK': 'treechat.io',
-        }
-        const custodialRelay = CUSTODIAL_RELAYS[addr] || null
-        text = JSON.stringify({
-          address: addr,
-          primary_display_name: primaryDisplayName,
-          display_name_count: displayNames.size,
-          total_posts: totalPosts,
-          total_replies: totalReplies,
-          reply_ratio: totalPosts > 0 ? +(totalReplies / totalPosts).toFixed(3) : 0,
-          first_seen_in_sample: firstSeen,
-          last_seen: lastSeen,
-          active_apps: Array.from(apps),
-          active_channels: Array.from(channels),
-          is_custodial_relay: custodialRelay !== null,
-          custodial_relay_name: custodialRelay,
-          sample_size: rows.length,
-          note: rows.length < totalPosts
-            ? `first_seen_in_sample covers only the latest ${rows.length} of ${totalPosts} posts — earliest post may be older`
-            : 'sample covers all posts',
-        }, null, 2)
+        text = JSON.stringify(await v2OrLegacy(
+          () => readProfile(overlayV2Get, args, (keys) => legacyAuthorTotals(overlayGet, keys)),
+          () => legacyProfile(overlayGet, args),
+        ), null, 2)
         break
       }
       case 'peck_follows': {
@@ -1716,13 +1700,22 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         break
       }
       case 'peck_thread':
-        text = JSON.stringify(await overlayGet(`/v1/thread/${args?.txid}`), null, 2)
+        text = JSON.stringify(await v2OrLegacy(
+          () => readThread(overlayV2Get, args?.txid),
+          () => legacyThread(overlayGet, args?.txid),
+        ), null, 2)
         break
       case 'peck_post_detail':
-        text = JSON.stringify(await overlayGet(`/v1/post/${args?.txid}`), null, 2)
+        text = JSON.stringify(await v2OrLegacy(
+          () => readPostDetail(overlayV2Get, args?.txid),
+          () => legacyPostDetail(overlayGet, args?.txid),
+        ), null, 2)
         break
       case 'peck_search':
-        text = JSON.stringify(await overlayGet(`/v1/search?q=${encodeURIComponent(String(args?.q || ''))}&limit=${args?.limit || 20}`), null, 2)
+        text = JSON.stringify(await v2OrLegacy(
+          () => readSearch(overlayV2Get, args),
+          () => legacySearch(overlayGet, args),
+        ), null, 2)
         break
       case 'peck_functions':
         text = JSON.stringify(await overlayGet(`/v1/functions${args?.app ? '?app=' + args.app : ''}`), null, 2)
