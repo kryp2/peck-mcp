@@ -40,14 +40,15 @@
   },
   "homepage": "https://github.com/kryp2/peck-mcp#readme",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@bsv/message-box-client": "^2.1.0",
-    "@bsv/sdk": "^2.0.13",
+    "@bsv/message-box-client": "^2.6.0",
+    "@bsv/sdk": "^2.8.11",
+    "@bsv/wallet-toolbox": "^2.14.9",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "bitcoin-agent-wallet": "^0.5.3",
     "dotenv": "^17.4.1"
@@ -56,5 +57,13 @@
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.8"
+  },
+  "overrides": {
+    "@bsv/sdk": "$@bsv/sdk",
+    "@bsv/wallet-toolbox": "$@bsv/wallet-toolbox",
+    "@bsv/message-box-client": "$@bsv/message-box-client",
+    "@bsv/auth-express-middleware": "^2.2.9",
+    "@bsv/payment-express-middleware": "^2.1.9",
+    "@bsv/authsocket-client": "^2.1.8"
   }
 }
