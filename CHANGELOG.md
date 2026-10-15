@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Security: BSV stack upgraded past the ts-stack advisories** (GHSA-2qqx, GHSA-5vmp,
+  GHSA-36f9, GHSA-qp3j, GHSA-622h). `@bsv/sdk` 2.0.13 -> 2.8.11, `@bsv/wallet-toolbox`
+  2.1.18 -> 2.14.9, `@bsv/message-box-client` 2.1.0 -> 2.6.0 (plus auth-express-middleware,
+  payment-express-middleware and authsocket-client via `overrides`). Node >= 22 is now
+  required (patched releases dropped Node 20). A local `.bitcoin-agent-wallet.db` is
+  migrated forward by wallet-toolbox on first open; do not reopen it with the old version.
+
 - **Read tools use the overlay's `/v2` read model.** `peck_feed`, `peck_recent`,
   `peck_search`, `peck_thread`, `peck_post_detail`, `peck_user_posts` and
   `peck_profile` now return the hydrated `peck-view/v1` objects the overlay
