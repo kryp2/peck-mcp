@@ -5,8 +5,13 @@ FROM node:22-slim
 
 WORKDIR /app
 
+# better-sqlite3 (pulled in by @bsv/wallet-toolbox 2.14.x) has no prebuilt
+# binary for this Node, so npm ci compiles it and needs a toolchain.
+RUN apt-get update -y && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
-RUN npm ci --production=false
+RUN npm ci --include=dev
 
 COPY src/ src/
 COPY tsconfig.json ./
