@@ -38,6 +38,7 @@ import {
   PROTO_B, PROTO_MAP, PROTO_AIP, PIPE,
 } from 'bitcoin-agent-wallet'
 import { buildMapScript } from '../schema-builders.js'
+import { parseSats } from './amounts.js'
 import {
   createV2Get, OverlayV2Unavailable,
   readFeed, readRecent, readUserPosts, readThread, readPostDetail, readSearch, readProfile,
@@ -1529,11 +1530,12 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           break
         }
         const targetTxid = args?.target_txid
-        const amountSats = Number(args?.amount_sats)
-        if (!targetTxid || !amountSats || amountSats < 1) {
-          text = JSON.stringify({ error: 'target_txid and amount_sats (>=1) required' })
+        const amount = parseSats(args?.amount_sats)
+        if (!targetTxid || !amount.ok) {
+          text = JSON.stringify({ error: amount.ok ? 'target_txid and amount_sats (>=1) required' : `amount_sats: ${amount.error}` })
           break
         }
+        const amountSats = amount.sats
         try {
           const appName = args?.agent_app || APP_NAME
 
@@ -2119,16 +2121,17 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         }
         try {
           const recipient = String(args?.recipient_identity_key || '')
-          const sats = Number(args?.sats || 0)
+          const amount = parseSats(args?.sats)
           const description = String(args?.description || '')
           if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
             text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
             break
           }
-          if (sats < 1) {
-            text = JSON.stringify({ error: 'sats must be >= 1' })
+          if (!amount.ok) {
+            text = JSON.stringify({ error: amount.error })
             break
           }
+          const sats = amount.sats
           if (!description) {
             text = JSON.stringify({ error: 'description required (shown to recipient in their wallet).' })
             break
@@ -2166,15 +2169,16 @@ async function handleToolCall(name: string, args: any): Promise<string> {
         }
         try {
           const recipient = String(args?.recipient_identity_key || '')
-          const sats = Number(args?.sats || 0)
+          const amount = parseSats(args?.sats)
           if (!/^[0-9a-fA-F]{66}$/.test(recipient)) {
             text = JSON.stringify({ error: 'recipient_identity_key must be 66 hex chars (compressed pubkey).' })
             break
           }
-          if (sats < 1) {
-            text = JSON.stringify({ error: 'sats must be >= 1' })
+          if (!amount.ok) {
+            text = JSON.stringify({ error: amount.error })
             break
           }
+          const sats = amount.sats
           await agent.wallet.sendLivePayment({ recipientIdentityKey: recipient, sats })
           text = JSON.stringify({
             success: true,
