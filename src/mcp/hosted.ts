@@ -65,3 +65,12 @@ export function hostedRefusal(name: string, args: Record<string, unknown> | unde
   }
   return null
 }
+
+/** Whether to read a .env file: always for HTTP, over stdio only from an explicit DOTENV_CONFIG_PATH. */
+export function shouldLoadDotenv(
+  env: Record<string, string | undefined> = process.env,
+  argv: readonly string[] = process.argv,
+): boolean {
+  const stdio = env.MCP_TRANSPORT === 'stdio' || argv.includes('--stdio')
+  return !stdio || !!env.DOTENV_CONFIG_PATH
+}
