@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { HOSTED_READ_ONLY_TOOLS, filterHostedTools, hostedRefusal, isReadOnlyMode } from './hosted.js'
+import { HOSTED_READ_ONLY_TOOLS, filterHostedTools, hostedRefusal, isReadOnlyMode, listenHost, requestAllowed } from './hosted.js'
 
 describe('isReadOnlyMode', () => {
   it('stdio (the npm install path) is never read-only', () => {
@@ -51,5 +51,34 @@ describe('hostedRefusal', () => {
     expect(hostedRefusal('peck_messages', {})).toBeNull()
     const r = JSON.parse(hostedRefusal('peck_messages', { signing_key: 'aa' })!)
     expect(r.error).toMatch(/never send a signing key/)
+  })
+})
+
+describe('listenHost', () => {
+  it('read-only listens on all interfaces (container behind a proxy)', () => {
+    expect(listenHost({}, true)).toBeUndefined()
+  })
+  it('HTTP with writes is loopback only unless PECK_MCP_HOST says otherwise', () => {
+    expect(listenHost({ PECK_MCP_ALLOW_WRITES: '1' }, false)).toBe('127.0.0.1')
+    expect(listenHost({ PECK_MCP_ALLOW_WRITES: '1', PECK_MCP_HOST: '10.0.0.5' }, false)).toBe('10.0.0.5')
+  })
+})
+
+describe('requestAllowed', () => {
+  it('lets everything through read-only', () => {
+    expect(requestAllowed({ host: 'mcp.peck.to', origin: 'https://evil.example' }, true)).toBe(true)
+  })
+  it('accepts loopback hosts with writes', () => {
+    expect(requestAllowed({ host: 'localhost:8080' }, false, {})).toBe(true)
+    expect(requestAllowed({ host: '127.0.0.1:8080', origin: 'http://localhost:3000' }, false, {})).toBe(true)
+    expect(requestAllowed({ host: '[::1]:8080' }, false, {})).toBe(true)
+  })
+  it('rejects a rebound Host or a foreign Origin with writes', () => {
+    expect(requestAllowed({ host: 'attacker.example:8080' }, false, {})).toBe(false)
+    expect(requestAllowed({}, false, {})).toBe(false)
+    expect(requestAllowed({ host: 'localhost:8080', origin: 'https://evil.example' }, false, {})).toBe(false)
+  })
+  it('honours PECK_MCP_ALLOWED_HOSTS', () => {
+    expect(requestAllowed({ host: 'mybox.lan:8080' }, false, { PECK_MCP_ALLOWED_HOSTS: 'mybox.lan' })).toBe(true)
   })
 })

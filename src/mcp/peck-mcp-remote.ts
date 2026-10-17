@@ -27,7 +27,11 @@ import { homedir } from 'os'
 import { join, dirname, resolve } from 'path'
 import { readFileSync, existsSync } from 'fs'
 import { fileURLToPath } from 'url'
-import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT } from './hosted.js'
+import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT, listenHost, requestAllowed } from './hosted.js'
+import {
+  BadJson, BodyTooLarge, SessionRegistry, envInt, readJsonBody,
+  DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_SESSIONS, DEFAULT_SESSION_TTL_MS,
+} from './http-guards.js'
 import { describeWalletInitFailure, type WalletInitFailure } from './wallet-diagnostics.js'
 import { monitorOf, syncProofs } from './proof-sync.js'
 import { openInboxes, pollInboxes } from './payment-inboxes.js'
@@ -2372,7 +2376,20 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================================
 
 // Each session gets its own Server+Transport pair (MCP SDK requirement)
-const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>()
+// The registry caps the number of sessions and expires idle ones (http-guards.ts).
+const sessions = new SessionRegistry<{ server: Server; transport: StreamableHTTPServerTransport }>(
+  envInt(process.env.PECK_MCP_MAX_SESSIONS, DEFAULT_MAX_SESSIONS),
+  envInt(process.env.PECK_MCP_SESSION_TTL_MS, DEFAULT_SESSION_TTL_MS),
+)
+const MAX_BODY_BYTES = envInt(process.env.PECK_MCP_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES)
+setInterval(() => {
+  for (const s of sessions.sweep()) void s.transport.close().catch(() => {})
+}, 60_000).unref()
+
+function sendJsonError(res: ServerResponse, status: number, message: string) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message }, id: null }))
+}
 
 function createSessionServer(): Server {
   const srv = new Server(
@@ -2409,9 +2426,16 @@ function serveStatic(res: ServerResponse, fname: string, type: string) {
 }
 
 const httpServer = createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, mcp-session-id')
+  // Writes enabled = this process signs as the local wallet with no auth: only
+  // answer requests addressed to this machine, and send no wildcard CORS.
+  if (!requestAllowed(req.headers, READ_ONLY)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('forbidden host or origin')
+  }
+  if (READ_ONLY) {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, mcp-session-id')
+  }
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
   const path = (req.url || '/').split('?')[0]
@@ -2491,11 +2515,24 @@ const httpServer = createServer(async (req, res) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined
 
     if (req.method === 'POST') {
-      // Existing valid session
-      if (sessionId && sessions.has(sessionId)) {
-        return sessions.get(sessionId)!.transport.handleRequest(req, res)
+      // The SDK would buffer an unbounded body; read it here with a cap.
+      let body: unknown
+      try {
+        body = await readJsonBody(req, MAX_BODY_BYTES)
+      } catch (e) {
+        if (e instanceof BodyTooLarge) return sendJsonError(res, 413, e.message)
+        if (e instanceof BadJson) return sendJsonError(res, 400, e.message)
+        throw e
       }
+      // Existing valid session
+      const existing = sessionId ? sessions.get(sessionId) : undefined
+      if (existing) return existing.transport.handleRequest(req, res, body)
       // New session
+      for (const s of sessions.sweep()) void s.transport.close().catch(() => {})
+      if (sessions.full) {
+        res.setHeader('Retry-After', '60')
+        return sendJsonError(res, 503, 'too many open sessions; retry later')
+      }
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
@@ -2503,12 +2540,11 @@ const httpServer = createServer(async (req, res) => {
         },
       })
       transport.onclose = () => {
-        const sid = [...sessions.entries()].find(([_, s]) => s.transport === transport)?.[0]
-        if (sid) sessions.delete(sid)
+        if (transport.sessionId) sessions.delete(transport.sessionId)
       }
       const srv = createSessionServer()
       await srv.connect(transport)
-      return transport.handleRequest(req, res)
+      return transport.handleRequest(req, res, body)
     }
 
     if (req.method === 'GET') {
@@ -2551,9 +2587,10 @@ if (USE_STDIO) {
   console.error(`[peck-mcp] overlay: ${OVERLAY_URL}`)
   console.error(`[peck-mcp] network: ${NETWORK}`)
 } else {
-  httpServer.listen(PORT, () => {
+  const HOST = listenHost(process.env, READ_ONLY)
+  httpServer.listen(PORT, HOST, () => {
     console.log(`[peck-mcp] v${PKG_VERSION} — ${READ_ONLY ? 'hosted read-only (no wallet)' : 'full (writes enabled)'}`)
-    console.log(`[peck-mcp] http://0.0.0.0:${PORT}`)
+    console.log(`[peck-mcp] http://${HOST ?? '0.0.0.0'}:${PORT}`)
     console.log(`[peck-mcp] overlay: ${OVERLAY_URL}`)
     console.log(`[peck-mcp] network: ${NETWORK}`)
     console.log(`[peck-mcp] ${TOOLS.length} tools`)

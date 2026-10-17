@@ -65,3 +65,39 @@ export function hostedRefusal(name: string, args: Record<string, unknown> | unde
   }
   return null
 }
+
+// ─── HTTP with writes (PECK_MCP_ALLOW_WRITES=1) ───────────────────────────
+// This mode signs as the machine's own wallet and has no authentication, so it
+// must only be reachable from the machine itself: loopback bind, and a Host /
+// Origin check so a web page cannot reach it through DNS rebinding.
+
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]']
+
+/** Interface to listen on. undefined = all interfaces (the read-only container behind Caddy). */
+export function listenHost(
+  env: Record<string, string | undefined> = process.env,
+  readOnly: boolean = isReadOnlyMode(env),
+): string | undefined {
+  if (env.PECK_MCP_HOST) return env.PECK_MCP_HOST
+  return readOnly ? undefined : '127.0.0.1'
+}
+
+function hostnameOf(value: string, withScheme: boolean): string | null {
+  try { return new URL(withScheme ? value : `http://${value}`).hostname.toLowerCase() } catch { return null }
+}
+
+/** False when a write-mode request names a Host or Origin that is not this machine. Always true read-only. */
+export function requestAllowed(
+  headers: Record<string, string | string[] | undefined>,
+  readOnly: boolean,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (readOnly) return true
+  const allowed = new Set([...LOOPBACK_HOSTS, ...(env.PECK_MCP_ALLOWED_HOSTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)])
+  const host = typeof headers.host === 'string' ? hostnameOf(headers.host, false) : null
+  if (!host || !allowed.has(host)) return false
+  const origin = headers.origin
+  if (origin === undefined) return true
+  const o = typeof origin === 'string' ? hostnameOf(origin, true) : null
+  return !!o && allowed.has(o)
+}
