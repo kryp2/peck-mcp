@@ -51,13 +51,13 @@ const PORT = parseInt(process.env.PORT || '8080', 10)
 const NETWORK = process.env.PECK_NETWORK || 'main'
 const OVERLAY_URL = process.env.PECK_READER_URL || 'https://overlay.peck.to'
 const IDENTITY_URL = process.env.IDENTITY_URL || 'https://identity.peck.to'
-// /v1/register er token-låst (internt skrive-endepunkt; kjeden er kanonisk).
+// /v1/register is token-locked (internal write endpoint; the chain is canonical).
 const IDENTITY_REGISTER_TOKEN = process.env.IDENTITY_REGISTER_TOKEN || ''
 /**
- * Uten Bearer-headeren svarer identity.peck.to 401 «internal token required»
- * (identity-services/backend/src/internalAuth.ts). Det er umulig å skille fra
- * en ekte auth-feil ovenfra, så vi feiler heller eksplisitt her: en glemt
- * env-var skal være synlig, ikke se ut som et avvist token.
+ * Without the Bearer header identity.peck.to answers 401 "internal token required"
+ * (identity-services/backend/src/internalAuth.ts). That is impossible to tell
+ * apart from a real auth failure from the outside, so we fail explicitly here
+ * instead: a forgotten env var should be visible, not look like a rejected token.
  */
 const IDENTITY_TOKEN_MISSING_MSG =
   'IDENTITY_REGISTER_TOKEN is not set for this peck-mcp process, but identity.peck.to /v1/register is token-locked. ' +
@@ -1936,8 +1936,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
           result.layers.profile_tx = { error: e.message }
         }
 
-        // LAYER 2 — identity.peck.to registry entry. Skrive-endepunktet er
-        // token-låst; uten Bearer svarer tjenesten 401 «internal token required».
+        // LAYER 2 — identity.peck.to registry entry. The write endpoint is
+        // token-locked; without a Bearer the service answers 401 "internal token required".
         try {
           if (IDENTITY_REGISTER_TOKEN === '') {
             result.layers.registry = { error: IDENTITY_TOKEN_MISSING_MSG }
