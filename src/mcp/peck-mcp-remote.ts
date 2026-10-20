@@ -11,7 +11,7 @@
  * therefore answers "wallet unavailable" to write-tools — local install
  * required for writes.
  */
-import 'dotenv/config'
+import './env.js'
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'

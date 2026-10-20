@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { HOSTED_READ_ONLY_TOOLS, filterHostedTools, hostedRefusal, isReadOnlyMode, listenHost, requestAllowed } from './hosted.js'
+import { HOSTED_READ_ONLY_TOOLS, filterHostedTools, hostedRefusal, isReadOnlyMode, listenHost, requestAllowed, shouldLoadDotenv } from './hosted.js'
 
 describe('isReadOnlyMode', () => {
   it('stdio (the npm install path) is never read-only', () => {
@@ -51,6 +51,19 @@ describe('hostedRefusal', () => {
     expect(hostedRefusal('peck_messages', {})).toBeNull()
     const r = JSON.parse(hostedRefusal('peck_messages', { signing_key: 'aa' })!)
     expect(r.error).toMatch(/never send a signing key/)
+  })
+})
+
+describe('shouldLoadDotenv', () => {
+  it('reads .env for HTTP', () => {
+    expect(shouldLoadDotenv({}, [])).toBe(true)
+  })
+  it('does not read ./.env over stdio, where the working directory is the user\'s project', () => {
+    expect(shouldLoadDotenv({ MCP_TRANSPORT: 'stdio' }, [])).toBe(false)
+    expect(shouldLoadDotenv({}, ['node', 'x', '--stdio'])).toBe(false)
+  })
+  it('reads an explicitly named file over stdio', () => {
+    expect(shouldLoadDotenv({ MCP_TRANSPORT: 'stdio', DOTENV_CONFIG_PATH: '/home/me/.peck.env' }, [])).toBe(true)
   })
 })
 
