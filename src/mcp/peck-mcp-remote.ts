@@ -2538,6 +2538,9 @@ const httpServer = createServer(async (req, res) => {
       // Existing valid session
       const existing = sessionId ? sessions.get(sessionId) : undefined
       if (existing) return existing.transport.handleRequest(req, res, body)
+      // A session id the server no longer knows (expired or closed): 404 tells
+      // the client to initialise again, per the Streamable HTTP spec.
+      if (sessionId) return sendJsonError(res, 404, 'session not found; send initialize again')
       // New session
       for (const s of sessions.sweep()) void s.transport.close().catch(() => {})
       const slot = sessions.reserve(clientAddress(req.socket.remoteAddress, req.headers))
