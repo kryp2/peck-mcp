@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **HTTP transport: sessions are limited per client address.** Each address
+  may hold up to `PECK_MCP_MAX_SESSIONS_PER_CLIENT` sessions (default 32;
+  IPv6 counts per /64), and a further `initialize` gets `429` with
+  `Retry-After`. While the registry is at least 80 % full, idle sessions expire
+  after `PECK_MCP_BUSY_SESSION_TTL_MS` (default 5 minutes) instead of the normal
+  lifetime. Behind a reverse proxy on the same host or a private network, the
+  address is the rightmost `X-Forwarded-For` entry; otherwise the socket peer.
+
 - **Security: BSV stack upgraded past the ts-stack advisories** (GHSA-2qqx, GHSA-5vmp,
   GHSA-36f9, GHSA-qp3j, GHSA-622h). `@bsv/sdk` 2.0.13 -> 2.8.11, `@bsv/wallet-toolbox`
   2.1.18 -> 2.14.9, `@bsv/message-box-client` 2.1.0 -> 2.6.0 (plus auth-express-middleware,
