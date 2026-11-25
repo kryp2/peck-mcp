@@ -29,8 +29,9 @@ import { readFileSync, existsSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { isReadOnlyMode, filterHostedTools, hostedRefusal, HOSTED_INSTALL_HINT, listenHost, requestAllowed } from './hosted.js'
 import {
-  BadJson, BodyTooLarge, SessionRegistry, envInt, readJsonBody,
+  BadJson, BodyTooLarge, SessionRegistry, clientAddress, envInt, readJsonBody,
   DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_SESSIONS, DEFAULT_SESSION_TTL_MS,
+  DEFAULT_MAX_SESSIONS_PER_CLIENT, DEFAULT_BUSY_SESSION_TTL_MS,
 } from './http-guards.js'
 import { describeWalletInitFailure, type WalletInitFailure } from './wallet-diagnostics.js'
 import { monitorOf, syncProofs } from './proof-sync.js'
@@ -2380,10 +2381,16 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================================
 
 // Each session gets its own Server+Transport pair (MCP SDK requirement)
-// The registry caps the number of sessions and expires idle ones (http-guards.ts).
+// The registry caps the number of sessions, per client address and in total,
+// and expires idle ones (http-guards.ts).
 const sessions = new SessionRegistry<{ server: Server; transport: StreamableHTTPServerTransport }>(
   envInt(process.env.PECK_MCP_MAX_SESSIONS, DEFAULT_MAX_SESSIONS),
   envInt(process.env.PECK_MCP_SESSION_TTL_MS, DEFAULT_SESSION_TTL_MS),
+  Date.now,
+  {
+    maxPerClient: envInt(process.env.PECK_MCP_MAX_SESSIONS_PER_CLIENT, DEFAULT_MAX_SESSIONS_PER_CLIENT),
+    busyTtlMs: envInt(process.env.PECK_MCP_BUSY_SESSION_TTL_MS, DEFAULT_BUSY_SESSION_TTL_MS),
+  },
 )
 const MAX_BODY_BYTES = envInt(process.env.PECK_MCP_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES)
 setInterval(() => {
@@ -2531,24 +2538,36 @@ const httpServer = createServer(async (req, res) => {
       // Existing valid session
       const existing = sessionId ? sessions.get(sessionId) : undefined
       if (existing) return existing.transport.handleRequest(req, res, body)
+      // A session id the server no longer knows (expired or closed): 404 tells
+      // the client to initialise again, per the Streamable HTTP spec.
+      if (sessionId) return sendJsonError(res, 404, 'session not found; send initialize again')
       // New session
       for (const s of sessions.sweep()) void s.transport.close().catch(() => {})
-      if (sessions.full) {
+      const slot = sessions.reserve(clientAddress(req.socket.remoteAddress, req.headers))
+      if (slot === 'full') {
         res.setHeader('Retry-After', '60')
         return sendJsonError(res, 503, 'too many open sessions; retry later')
+      }
+      if (slot === 'client-limit') {
+        res.setHeader('Retry-After', '60')
+        return sendJsonError(res, 429, 'too many open sessions from this address; close one (DELETE /mcp) or retry later')
       }
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
-          sessions.set(sid, { server: srv, transport })
+          slot.commit(sid, { server: srv, transport })
         },
       })
       transport.onclose = () => {
         if (transport.sessionId) sessions.delete(transport.sessionId)
       }
       const srv = createSessionServer()
-      await srv.connect(transport)
-      return transport.handleRequest(req, res, body)
+      try {
+        await srv.connect(transport)
+        return await transport.handleRequest(req, res, body)
+      } finally {
+        slot.release()
+      }
     }
 
     if (req.method === 'GET') {
